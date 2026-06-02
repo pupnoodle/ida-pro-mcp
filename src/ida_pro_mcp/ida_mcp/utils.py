@@ -18,7 +18,6 @@ from typing import (
     overload,
 )
 
-import ida_bytes
 import ida_funcs
 import ida_hexrays
 import ida_kernwin
@@ -86,15 +85,13 @@ class CommentOp(TypedDict):
     comment: Annotated[str, "Comment text"]
 
 
-class CommentAppendOp(TypedDict):
+class CommentAppendOp(TypedDict, total=False):
     """Comment append operation"""
 
     addr: Annotated[str, "Address (hex or decimal)"]
     comment: Annotated[str, "Comment text to append"]
-    scope: NotRequired[Annotated[str, "auto|func|line (default: auto)"]]
-    dedupe: NotRequired[
-        Annotated[bool, "Skip if exact text already exists (default: true)"]
-    ]
+    scope: Annotated[str, "auto|func|line (default: auto)"]
+    dedupe: Annotated[bool, "Skip if exact text already exists (default: true)"]
 
 
 class AsmPatchOp(TypedDict):
@@ -135,22 +132,20 @@ class StackRename(TypedDict):
 
 
 class RenameBatch(TypedDict, total=False):
-    """Batch rename operations across all entity types.
-
-    At least one of func/data/local/stack should be present.
-    """
+    """Batch rename operations across all entity types"""
 
     func: Annotated[
-        list[FunctionRename] | FunctionRename, "Function rename operations"
+        list[FunctionRename] | FunctionRename | None, "Function rename operations"
     ]
     data: Annotated[
-        list[GlobalRename] | GlobalRename, "Global/data variable rename operations"
+        list[GlobalRename] | GlobalRename | None,
+        "Global/data variable rename operations",
     ]
     local: Annotated[
-        list[LocalRename] | LocalRename, "Local variable rename operations"
+        list[LocalRename] | LocalRename | None, "Local variable rename operations"
     ]
     stack: Annotated[
-        list[StackRename] | StackRename, "Stack variable rename operations"
+        list[StackRename] | StackRename | None, "Stack variable rename operations"
     ]
     stop_on_error: Annotated[bool, "Stop on first failure"]
     dry_run: Annotated[bool, "Validate only, no changes"]
@@ -164,18 +159,18 @@ class StructFieldQuery(TypedDict):
     field: Annotated[str, "Field name"]
 
 
-class XrefQuery(TypedDict):
+class XrefQuery(TypedDict, total=False):
     """Generic cross-reference query"""
 
-    addr: Annotated[str, "Address or name"]
-    direction: NotRequired[Annotated[str, "to|from|both (default: both)"]]
-    xref_type: NotRequired[Annotated[str, "any|code|data (default: any)"]]
-    offset: NotRequired[Annotated[int, "Start index (default: 0)"]]
-    count: NotRequired[Annotated[int, "Max results (default: 200, max: 5000)"]]
-    include_fn: NotRequired[Annotated[bool, "Include function metadata"]]
-    dedup: NotRequired[Annotated[bool, "Deduplicate by addr/type"]]
-    sort_by: NotRequired[Annotated[str, "Sort: addr|type"]]
-    descending: NotRequired[Annotated[bool, "Descending"]]
+    query: Annotated[str, "Address or name"]
+    direction: Annotated[str, "to|from|both"]
+    xref_type: Annotated[str, "any|code|data"]
+    offset: Annotated[int, "Start index"]
+    count: Annotated[int, "Max results (max: 5000)"]
+    include_fn: Annotated[bool, "Include function metadata"]
+    dedup: Annotated[bool, "Deduplicate by addr/type"]
+    sort_by: Annotated[str, "Sort: addr|type"]
+    descending: Annotated[bool, "Descending"]
 
 
 class ListQuery(TypedDict, total=False):
@@ -200,30 +195,27 @@ class FunctionQuery(TypedDict, total=False):
     descending: Annotated[bool, "Descending"]
 
 
-class EntityQuery(TypedDict):
+class EntityQuery(TypedDict, total=False):
     """Generic IDB entity query with filtering, projection, and pagination"""
 
     kind: Annotated[str, "functions|globals|imports|strings|names"]
-    filter: NotRequired[Annotated[str, "Glob/regex filter"]]
-    regex: NotRequired[Annotated[str, "Regex on primary text field"]]
-    min_addr: NotRequired[Annotated[str, "Min address bound"]]
-    max_addr: NotRequired[Annotated[str, "Max address bound"]]
-    segment: NotRequired[Annotated[str, "Segment filter"]]
-    module: NotRequired[Annotated[str, "Import module filter"]]
-    offset: NotRequired[Annotated[int, "Start index"]]
-    count: NotRequired[Annotated[int, "Max results (0=all)"]]
-    sort_by: NotRequired[Annotated[str, "Sort: addr|name|size|length"]]
-    descending: NotRequired[Annotated[bool, "Descending"]]
-    fields: NotRequired[Annotated[list[str], "Projection field list"]]
+    filter: Annotated[str, "Glob/regex filter"]
+    regex: Annotated[str, "Regex on primary text field"]
+    min_addr: Annotated[str, "Min address bound"]
+    max_addr: Annotated[str, "Max address bound"]
+    segment: Annotated[str, "Segment filter"]
+    module: Annotated[str, "Import module filter"]
+    offset: Annotated[int, "Start index"]
+    count: Annotated[int, "Max results (0=all)"]
+    sort_by: Annotated[str, "Sort: addr|name|size|length"]
+    descending: Annotated[bool, "Descending"]
+    fields: Annotated[list[str] | str, "Projection field list"]
 
 
 class FuncProfileQuery(TypedDict, total=False):
-    """Function profiling query with pagination and optional detail lists.
+    """Function profiling query with pagination and optional detail lists"""
 
-    All fields are optional - omit addr to profile all functions.
-    """
-
-    addr: Annotated[str, "Function address or name (omit or '*' for all)"]
+    query: Annotated[str, "Address/name or '*'"]
     filter: Annotated[str, "Name glob/regex"]
     offset: Annotated[int, "Start index"]
     count: Annotated[int, "Max results (0=all)"]
@@ -234,25 +226,25 @@ class FuncProfileQuery(TypedDict, total=False):
     include_prototype: Annotated[bool, "Include prototype"]
 
 
-class AnalyzeBatchQuery(TypedDict):
+class AnalyzeBatchQuery(TypedDict, total=False):
     """Comprehensive function analysis request"""
 
-    addr: Annotated[str, "Function address or name"]
-    include_decompile: NotRequired[Annotated[bool, "Include decompiler output"]]
-    include_disasm: NotRequired[Annotated[bool, "Include disassembly"]]
-    include_xrefs: NotRequired[Annotated[bool, "Include xrefs-to/from"]]
-    include_callers: NotRequired[Annotated[bool, "Include callers"]]
-    include_callees: NotRequired[Annotated[bool, "Include callees"]]
-    include_strings: NotRequired[Annotated[bool, "Include strings"]]
-    include_constants: NotRequired[Annotated[bool, "Include constants"]]
-    include_basic_blocks: NotRequired[Annotated[bool, "Include basic blocks"]]
-    include_proto: NotRequired[Annotated[bool, "Include prototype"]]
-    max_disasm_insns: NotRequired[Annotated[int, "Max disasm instructions"]]
-    max_callers: NotRequired[Annotated[int, "Max callers"]]
-    max_callees: NotRequired[Annotated[int, "Max callees"]]
-    max_strings: NotRequired[Annotated[int, "Max strings"]]
-    max_constants: NotRequired[Annotated[int, "Max constants"]]
-    max_blocks: NotRequired[Annotated[int, "Max blocks"]]
+    query: Annotated[str, "Function address or name"]
+    include_decompile: Annotated[bool, "Include decompiler output"]
+    include_disasm: Annotated[bool, "Include disassembly"]
+    include_xrefs: Annotated[bool, "Include xrefs-to/from"]
+    include_callers: Annotated[bool, "Include callers"]
+    include_callees: Annotated[bool, "Include callees"]
+    include_strings: Annotated[bool, "Include strings"]
+    include_constants: Annotated[bool, "Include constants"]
+    include_basic_blocks: Annotated[bool, "Include basic blocks"]
+    include_proto: Annotated[bool, "Include prototype"]
+    max_disasm_insns: Annotated[int, "Max disasm instructions"]
+    max_callers: Annotated[int, "Max callers"]
+    max_callees: Annotated[int, "Max callees"]
+    max_strings: Annotated[int, "Max strings"]
+    max_constants: Annotated[int, "Max constants"]
+    max_blocks: Annotated[int, "Max blocks"]
 
 
 class ImportQuery(TypedDict, total=False):
@@ -264,12 +256,12 @@ class ImportQuery(TypedDict, total=False):
     count: Annotated[int, "Max results (0=all)"]
 
 
-class TypeInspectQuery(TypedDict):
+class TypeInspectQuery(TypedDict, total=False):
     """Type inspection request"""
 
     name: Annotated[str, "Type name"]
-    include_members: NotRequired[Annotated[bool, "Include UDT member details"]]
-    max_members: NotRequired[Annotated[int, "Max members"]]
+    include_members: Annotated[bool, "Include UDT member details"]
+    max_members: Annotated[int, "Max members"]
 
 
 class TypeQuery(TypedDict, total=False):
@@ -292,23 +284,6 @@ class BreakpointOp(TypedDict):
 
     addr: Annotated[str, "Breakpoint address (hex or decimal)"]
     enabled: Annotated[bool, "Enable (true) or disable (false)"]
-
-
-class BreakpointConditionBase(TypedDict):
-    """Debugger breakpoint condition operation"""
-
-    addr: Annotated[str, "Breakpoint address (hex or decimal)"]
-
-
-class BreakpointConditionOp(BreakpointConditionBase, total=False):
-    condition: Annotated[
-        Optional[str], "Breakpoint condition expression; null/empty clears it"
-    ]
-    language: Annotated[
-        Optional[str],
-        "Condition language ('idc', 'python', or exact IDA extlang name); null preserves current/default",
-    ]
-    low_level: Annotated[bool, "Set a low-level/server-side condition when true"]
 
 
 class InsnPattern(TypedDict, total=False):
@@ -349,15 +324,15 @@ class StructRead(TypedDict, total=False):
     struct: Annotated[NotRequired[str], "Struct name (auto-detect if omitted)"]
 
 
-class TypeEdit(TypedDict):
+class TypeEdit(TypedDict, total=False):
     """Type application operation"""
 
-    addr: Annotated[str, "Address (function, global, or stack frame)"]
-    ty: NotRequired[Annotated[str, "Type name or declaration"]]
-    name: NotRequired[Annotated[str, "Variable/function name"]]
-    kind: NotRequired[Annotated[str, "Entity kind (auto-detected)"]]
-    signature: NotRequired[Annotated[str, "Function signature"]]
-    variable: NotRequired[Annotated[str, "Local variable name"]]
+    addr: Annotated[str, "Address"]
+    name: Annotated[str, "Variable/function name"]
+    ty: Annotated[str, "Type name or declaration"]
+    kind: Annotated[str, "Entity kind (auto-detected)"]
+    signature: Annotated[str, "Function signature"]
+    variable: Annotated[str, "Local variable name"]
 
 
 class EnumMemberUpsert(TypedDict, total=False):
@@ -375,11 +350,11 @@ class EnumUpsert(TypedDict, total=False):
     bitfield: Annotated[bool, "Bitfield enum"]
 
 
-class TypeApplyBatch(TypedDict):
+class TypeApplyBatch(TypedDict, total=False):
     """Batch type application configuration"""
 
     edits: Annotated[list[TypeEdit] | TypeEdit, "Type edits to apply"]
-    stop_on_error: NotRequired[Annotated[bool, "Stop on first failure"]]
+    stop_on_error: Annotated[bool, "Stop on first failure"]
 
 
 class StackVarDecl(TypedDict):
@@ -540,7 +515,6 @@ class Breakpoint(TypedDict):
     addr: str
     enabled: bool
     condition: Optional[str]
-    language: Optional[str]
 
 
 class FunctionAnalysis(TypedDict):
@@ -626,39 +600,24 @@ def parse_address(addr: str | int) -> int:
         raise IDAError(f"Failed to parse address (missing 0x prefix): {addr}")
 
 
-def read_bytes_bss_safe(ea: int, size: int) -> bytes:
-    """Read `size` bytes starting at `ea`, substituting 0 for unloaded bytes.
+def resolve_addr(addr: str) -> int:
+    """Resolve an address or symbol name to an EA. Raises IDAError on failure.
 
-    Unloaded bytes in BSS-like sections are zero at runtime by every mainstream
-    loader, but ida_bytes.get_byte() returns 0xFF as a sentinel for them. Patch
-    that here so reads of globals in .bss return the real zero-initialized
-    value instead of 0xff garbage.
+    Thin wrapper around parse_address that also handles IDAError from a
+    failed parse by attempting a name lookup, then re-raising with a clear
+    error message. Use this when you need a hard failure (rather than
+    parse_address's softer "name not found" semantics) for callers that
+    cannot recover from a bad address.
     """
-    out = bytearray(size)
-    for i in range(size):
-        if ida_bytes.is_loaded(ea + i):
-            out[i] = ida_bytes.get_byte(ea + i)
-    return bytes(out)
+    import idaapi
 
-
-def read_int_bss_safe(ea: int, size: int) -> int:
-    """Read an integer of `size` bytes at `ea`, honoring IDB endianness.
-
-    Returns 0 if the byte at `ea` is not loaded (BSS / zero-initialized region).
-    Uses IDA's native sized readers (get_byte/word/dword/qword) for loaded
-    bytes so the result respects the database endianness.
-    """
-    if not ida_bytes.is_loaded(ea):
-        return 0
-    if size == 1:
-        return ida_bytes.get_byte(ea)
-    if size == 2:
-        return ida_bytes.get_word(ea)
-    if size == 4:
-        return ida_bytes.get_dword(ea)
-    if size == 8:
-        return ida_bytes.get_qword(ea)
-    raise ValueError(f"unsupported integer size: {size}")
+    try:
+        return parse_address(addr)
+    except IDAError:
+        ea = idaapi.get_name_ea(idaapi.BADADDR, addr)
+        if ea == idaapi.BADADDR:
+            raise IDAError(f"Address/name not found: {addr!r}")
+        return ea
 
 
 def normalize_list_input(value: list | str) -> list:
@@ -1122,7 +1081,15 @@ def decompile_checked(addr: int):
 
 
 def decompile_function_safe(ea: int, include_addresses: bool = True) -> Optional[str]:
-    """Safely decompile a function, returning None on failure (uses cache)"""
+    """Safely decompile a function, returning None on failure (uses cache)
+
+    Args:
+        ea: function start EA.
+        include_addresses: when True (default), prepend each line with
+            /*0xNNNN*/ markers so the caller can tie pseudocode lines back
+            to source instructions. Pass False to save tokens; the output
+            will have no per-line EA markers.
+    """
     import ida_lines
     import ida_kernwin
 

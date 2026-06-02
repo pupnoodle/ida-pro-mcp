@@ -44,12 +44,12 @@ def _check_required_apis(version: tuple[int, int, int]) -> None:
     that were added in 8.5 and later reinstated in 9.0 SP1 (build 241217).
     Rather than adding compatibility hacks, we explicitly reject this version.
 
-    Older IDA versions (<8.5) legitimately lack these methods; the wrappers in
-    this module (get_func_name, get_func_prototype, tinfo_get_udm) provide
-    fallbacks, so we only enforce the check on IDA 9.0+.
+    Older IDA versions (<9.0) legitimately lack these methods; the wrappers
+    in this module (get_func_name, get_func_prototype, tinfo_get_udm, ...)
+    provide fallbacks, so the check is only enforced on 9.0+.
     """
-    # Only IDA 9.0+ is expected to have these methods natively. Pre-8.5 versions
-    # are handled via fallback wrappers in this module.
+    # Only IDA 9.0+ is expected to have these methods natively. Pre-9.0
+    # versions are handled via fallback wrappers in this module.
     if version < (9, 0, 0):
         return
 
@@ -150,7 +150,7 @@ def get_entry(ordinal: int) -> int:
 
 
 def get_entry_name(ordinal: int) -> str | None:
-    return _get_entry_name(ordinal)
+    return _get_entry_name()
 
 
 # ============================================================================
@@ -344,7 +344,7 @@ def tinfo_get_udm(
 
     udm = ida_typeinf.udm_t()
     tid = tif.get_udm_tid(idx)
-    # get_udm_by_tid returns 0 on success (C convention), check if udm.name is populated
+    # get_udm_by_tid returns 0 on success (C convention); check if udm.name is populated
     tif.get_udm_by_tid(udm, tid)
     if udm.name:
         return idx, udm

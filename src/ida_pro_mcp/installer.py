@@ -329,6 +329,7 @@ def list_available_clients():
     print("  ida-pro-mcp --install claude,cursor                       # Specific client targets")
     print("  ida-pro-mcp --install vscode --scope project              # Project-level config")
     print("  ida-pro-mcp --install cursor --transport streamable-http  # Streamable HTTP config")
+    print("  ida-pro-mcp --install --ida-dir C:\\path\\to\\ida         # Custom IDA install root")
     print("  ida-pro-mcp --uninstall cursor                            # Uninstall specific target")
 
 
@@ -424,6 +425,49 @@ def _get_ida_user_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".idapro")
 
 
+def _normalize_ida_dir(ida_dir: str) -> str:
+    return os.path.abspath(os.path.expanduser(ida_dir))
+
+
+def _is_ida_plugins_dir(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    marker_names = {"plugins.cfg", "idapython3.dll"}
+    existing_names = {name.lower() for name in os.listdir(path)}
+    return bool(marker_names & existing_names)
+
+
+def _resolve_ida_root_dir(ida_dir: str | None = None) -> str:
+    if ida_dir:
+        path = _normalize_ida_dir(ida_dir)
+        if _is_ida_plugins_dir(path) or os.path.basename(path).lower() == "plugins":
+            return os.path.dirname(path)
+        return path
+    return _get_ida_user_dir()
+
+
+def _resolve_ida_plugin_dir(ida_dir: str | None = None) -> str:
+    if ida_dir:
+        path = _normalize_ida_dir(ida_dir)
+        if _is_ida_plugins_dir(path) or os.path.basename(path).lower() == "plugins":
+            return path
+        return os.path.join(path, "plugins")
+    return os.path.join(_get_ida_user_dir(), "plugins")
+
+
+def _find_free_license(root_dir: str) -> list[str]:
+    patterns = [
+        os.path.join(root_dir, "idafree_*.hexlic"),
+        os.path.join(_get_ida_user_dir(), "idafree_*.hexlic"),
+    ]
+    matches: list[str] = []
+    for pattern in patterns:
+        for match in glob.glob(pattern):
+            if match not in matches:
+                matches.append(match)
+    return matches
+
+
 def _remove_path(path: str) -> None:
     if not os.path.lexists(path):
         return
@@ -451,23 +495,27 @@ def _install_link_or_copy(source: str, destination: str) -> bool:
     return True
 
 
-def is_ida_plugin_installed() -> bool:
-    return os.path.lexists(os.path.join(_get_ida_user_dir(), "plugins", "ida_mcp.py"))
+def is_ida_plugin_installed(*, ida_dir: str | None = None) -> bool:
+    return os.path.lexists(os.path.join(_resolve_ida_plugin_dir(ida_dir), "ida_mcp.py"))
 
 
 def install_ida_plugin(
-    *, uninstall: bool = False, quiet: bool = False, allow_ida_free: bool = False
+    *,
+    uninstall: bool = False,
+    quiet: bool = False,
+    allow_ida_free: bool = False,
+    ida_dir: str | None = None,
 ):
-    ida_folder = _get_ida_user_dir()
+    ida_root_dir = _resolve_ida_root_dir(ida_dir)
     if not allow_ida_free:
-        free_licenses = glob.glob(os.path.join(ida_folder, "idafree_*.hexlic"))
+        free_licenses = _find_free_license(ida_root_dir)
         if free_licenses:
             print(
                 "IDA Free does not support plugins and cannot be used. Purchase and install IDA Pro instead."
             )
             sys.exit(1)
 
-    ida_plugin_folder = os.path.join(ida_folder, "plugins")
+    ida_plugin_folder = _resolve_ida_plugin_dir(ida_dir)
     loader_destination = os.path.join(ida_plugin_folder, "ida_mcp.py")
     pkg_destination = os.path.join(ida_plugin_folder, "ida_mcp")
     old_plugin = os.path.join(ida_plugin_folder, "mcp-plugin.py")
@@ -486,10 +534,11 @@ def install_ida_plugin(
         if not quiet:
             if removed_items:
                 print("Uninstalled IDA Pro plugin")
+                print(f"  target: {ida_plugin_folder}")
                 for item in removed_items:
                     print(f"  {item}")
             else:
-                print("Skipping IDA plugin uninstall (not installed)")
+                print(f"Skipping IDA plugin uninstall (not installed)\n  target: {ida_plugin_folder}")
         return
 
     os.makedirs(ida_plugin_folder, exist_ok=True)
@@ -507,12 +556,15 @@ def install_ida_plugin(
     if not quiet:
         if installed_items or removed_old_plugin:
             print("Installed IDA Pro plugin (IDA restart required)")
+            print(f"  target: {ida_plugin_folder}")
             if removed_old_plugin:
                 print(f"  removed old plugin: {old_plugin}")
             for item in installed_items:
                 print(f"  {item}")
         else:
-            print("Skipping IDA plugin installation (already up to date)")
+            print(
+                f"Skipping IDA plugin installation (already up to date)\n  target: {ida_plugin_folder}"
+            )
 
 
 def _resolve_transport(value: str) -> str:
@@ -630,7 +682,11 @@ def _interactive_install(*, uninstall: bool, args):
 
 
 def run_install_command(*, uninstall: bool, targets_str: str, args) -> None:
-    install_ida_plugin(uninstall=uninstall, allow_ida_free=args.allow_ida_free)
+    install_ida_plugin(
+        uninstall=uninstall,
+        allow_ida_free=args.allow_ida_free,
+        ida_dir=args.ida_dir,
+    )
 
     if targets_str:
         _apply_client_install(

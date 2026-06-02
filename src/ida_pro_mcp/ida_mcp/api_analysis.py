@@ -44,6 +44,7 @@ from .utils import (
     InsnPattern,
     FuncProfileQuery,
     AnalyzeBatchQuery,
+    resolve_addr,
 )
 from . import compat
 
@@ -93,7 +94,7 @@ class FuncProfileItem(TypedDict, total=False):
 
 
 class FuncProfileResult(TypedDict, total=False):
-    target: str
+    query: str
     data: list[FuncProfileItem]
     next_offset: int | None
     error: str | None
@@ -143,7 +144,7 @@ class AnalyzeBatchDetails(TypedDict, total=False):
 
 
 class AnalyzeBatchResult(TypedDict, total=False):
-    target: str
+    query: str
     addr: str | None
     name: str | None
     analysis: AnalyzeBatchDetails | None
@@ -172,7 +173,7 @@ XrefQueryRow = TypedDict(
 
 
 class XrefQueryResult(TypedDict, total=False):
-    target: str
+    query: str
     resolved_addr: str | None
     direction: str
     xref_type: str
@@ -208,6 +209,37 @@ class FindBytesResult(TypedDict, total=False):
     n: int
     cursor: ResultCursor
     error: str
+
+
+class BuildSignatureResult(TypedDict, total=False):
+    query: str
+    addr: str | None
+    function_addr: str | None
+    function_name: str | None
+    pattern: str | None
+    byte_length: int
+    instruction_count: int
+    wildcard_bytes: int
+    match_count: int | None
+    unique: bool | None
+    matches: list[str]
+    error: str | None
+
+
+class VtableEntry(TypedDict):
+    slot: int
+    addr: str
+    name: str
+
+
+class VtableCandidateResult(TypedDict, total=False):
+    addr: str
+    segment: str
+    entry_count: int
+    xref_count: int
+    xrefs: list[str]
+    entries: list[VtableEntry]
+    error: str | None
 
 
 class BasicBlocksResult(TypedDict, total=False):
@@ -497,6 +529,12 @@ def _resolve_function_start(query: object) -> tuple[int | None, str | None]:
 
 
 def _collect_line_comments(ea: int) -> list[str]:
+    """Return anterior + inline + repeatable + posterior comments for `ea` in stable order.
+
+    Order contract (used by tests): anterior lines in index order, then
+    regular comment, then repeatable comment, then posterior lines in
+    index order. Empty strings are filtered out.
+    """
     out: list[str] = []
     i = 0
     while True:
@@ -518,10 +556,16 @@ def _collect_line_comments(ea: int) -> list[str]:
             break
         out.append(ida_lines.tag_remove(line))
         i += 1
-    return out
+    return [c for c in out if c]
 
 
 def _resolve_ref_name(ea: int) -> str:
+    """Resolve a referenced EA to its best-known name.
+
+    Prefers the global symbol table (labels set by IDA auto-analysis, the
+    user, or other tools). Falls back to the containing function's name
+    only when the EA is exactly a function start.
+    """
     name = ida_name.get_ea_name(ea)
     if name:
         return name
@@ -535,6 +579,12 @@ _STR_CODECS = {0: "utf-8", 1: "utf-16-le", 2: "utf-32-le"}
 
 
 def _resolve_ref(ea: int) -> dict | None:
+    """Build a Ref dict for `ea`, or None if the EA has no name we can show.
+
+    When the EA is a string literal, also decode the bytes and attach them
+    under the `string` key so the caller sees the literal text instead of
+    having to do a second round-trip.
+    """
     name = _resolve_ref_name(ea)
     if not name:
         return None
@@ -555,6 +605,12 @@ def _resolve_ref(ea: int) -> dict | None:
 
 
 def _collect_decompile_refs(cfunc) -> list[dict]:
+    """Walk the decompiled AST and collect every cot_obj reference.
+
+    Used by decompile() to populate the `refs` field with a deduplicated
+    list of {addr, name, string?} entries. Includes function calls, global
+    loads, and string-literal references when their target is named.
+    """
     import ida_hexrays
 
     seen: set[int] = set()
@@ -579,6 +635,11 @@ def _collect_decompile_refs(cfunc) -> list[dict]:
 
 
 def _collect_line_refs(ea: int) -> list[dict]:
+    """Collect code + data references originating at the instruction at `ea`.
+
+    Used by disasm() to annotate each disassembly line with the symbols
+    it references, so agents don't have to follow xrefs manually.
+    """
     seen: set[int] = set()
     refs: list[dict] = []
     for ref_ea in idautils.CodeRefsFrom(ea, False):
@@ -747,12 +808,25 @@ def _profile_function(
 @idasync
 @tool_timeout(90.0)
 def decompile(
-    addr: Annotated[str, "Function address or name to decompile"],
+    addr: Annotated[str, "Function address (hex) or function name to decompile. This is a single function only; for many functions in one call, use analyze_batch."],
     include_addresses: Annotated[
-        bool, "Append /*0xNNNN*/ markers per line (default: true). Set false to save tokens."
+        bool,
+        "Append /*0xNNNN*/ markers per line so each line of pseudocode can be tied back to a source instruction (default: true). Set false to save tokens; you lose the ability to cross-reference the decompiled code back to addresses.",
     ] = True,
 ) -> DecompileResult:
-    """Decompile function(s) at address(es); returns pseudocode and per-item errors."""
+    """Decompile one function and return its pseudocode.
+
+    Returns {addr, code, error?}. When error is non-null, code is null
+    and the decompilation failed (e.g. function not found, Hex-Rays not
+    available, or the function is too large / complex to decompile).
+
+    Differences vs. analyze_function
+    --------------------------------
+    - decompile: just the pseudocode. Cheap, focused.
+    - analyze_function: decompilation + disassembly + xrefs + callers +
+      callees + strings + constants + basic blocks + comments in one
+      call. Use when you need everything about a single function.
+    """
     try:
         start = parse_address(addr)
         code = decompile_function_safe(start, include_addresses=include_addresses)
@@ -779,16 +853,22 @@ def decompile(
 @idasync
 @tool_timeout(90.0)
 def disasm(
-    addr: Annotated[str, "Function address or name to disassemble"],
+    addr: Annotated[str, "Function address (hex) or function name to disassemble. If the address falls inside a function, disassembly starts there (start_ea in the response reflects the requested EA, not the function start)."],
     max_instructions: Annotated[
-        int, "Max instructions per function (default: 5000, max: 50000)"
+        int, "Max instructions to return (default: 5000, max: 50000). Use a smaller value for large functions; page with offset."
     ] = 5000,
-    offset: Annotated[int, "Skip first N instructions (default: 0)"] = 0,
+    offset: Annotated[int, "Skip first N instructions (default: 0). Use with cursor.next to walk a long function in chunks."] = 0,
     include_total: Annotated[
-        bool, "Compute total instruction count (default: false)"
+        bool, "Set true to compute the total instruction count of the function (slightly slower; the result appears as total_instructions)."
     ] = False,
 ) -> DisasmResult:
-    """Disassemble function with offset/max_instructions pagination and optional total count."""
+    """Disassemble a function with offset/max_instructions pagination.
+
+    The response asm object contains: name, start_ea, segment, optional
+    return_type / arguments / stack_frame, and the disassembly lines.
+    Use the cursor (cursor.next) to fetch the next page when
+    instruction_count == max_instructions.
+    """
 
     # Enforce max limit
     if max_instructions <= 0 or max_instructions > 50000:
@@ -935,16 +1015,50 @@ def disasm(
 @tool_timeout(120.0)
 def func_profile(
     queries: Annotated[
-        list[FuncProfileQuery] | FuncProfileQuery,
-        "Function profiling query (supports name/address filters + pagination)",
+        list[FuncProfileQuery] | FuncProfileQuery | str,
+        "Function profiling query. Use this when you need a quick health-check of many functions at once (sizes, callgraph density, type coverage) without paying for full decompilation of each one. Pass a function name/address to profile a single function, or a filter glob like 'sub_*' to profile many.",
     ],
 ) -> list[FuncProfileResult]:
-    """Profile functions with summary metrics and optional sampled details."""
-    queries = normalize_dict_list(queries)
+    """Profile functions with summary metrics and optional sampled details.
+
+    Each input produces one result entry with: addr, name, size, instruction
+    count, basic block count, caller/callee counts, string/constant
+    reference counts, has_type flag, and (if include_prototype=true) the
+    current prototype. If include_lists=true, sampled callers/callees/
+    strings/constants are also returned (capped by max_items).
+
+    Differences vs. analyze_batch
+    -----------------------------
+    - func_profile is cheaper and skips decompilation by default; great
+      when you want a wide overview of N functions.
+    - analyze_batch is heavier and includes decompilation by default;
+      use it when you actually need pseudocode for each function.
+
+    Differences vs. analyze_function
+    --------------------------------
+    - analyze_function is a single function at a time, with everything
+      (decompile + disasm + xrefs + callers + callees + strings +
+      constants + basic blocks + comments) in one shot.
+    - func_profile is a many-at-once summary; flip include_lists to
+      pull sample lists without paying for decompilation.
+    """
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {
+            "query": s,
+            "offset": 0,
+            "count": 50,
+            "sort_by": "addr",
+            "descending": False,
+            "include_lists": False,
+            "max_items": 25,
+            "include_prototype": False,
+        },
+    )
 
     results: list[dict] = []
     for query in queries:
-        q = str(query.get("addr", "*") or "*").strip()
+        q = str(query.get("query", "*") or "*").strip()
         filter_pattern = str(query.get("filter", "") or "")
         offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
         count = _clamp_int(query.get("count", 50), 50, 0, 1000)
@@ -961,7 +1075,7 @@ def func_profile(
             if err is not None or start_ea is None:
                 results.append(
                     {
-                        "target": q,
+                        "query": q,
                         "data": [],
                         "next_offset": None,
                         "error": err or "Failed to resolve function",
@@ -1021,7 +1135,7 @@ def func_profile(
 
         results.append(
             {
-                "target": q,
+                "query": q,
                 "data": profiled,
                 "next_offset": page["next_offset"],
                 "error": None,
@@ -1036,24 +1150,72 @@ def func_profile(
 @tool_timeout(120.0)
 def analyze_batch(
     queries: Annotated[
-        list[AnalyzeBatchQuery] | AnalyzeBatchQuery,
-        "Comprehensive per-function analysis with selectable sections",
+        list[AnalyzeBatchQuery] | AnalyzeBatchQuery | str,
+        "One function or a list of functions to analyze. Three accepted shapes: (a) a bare function name/address string — analyzed with all sections on; (b) a single object {query, include_*, max_*} — one function with your choice of sections; (c) a list of either form for batch analysis. See the result description below for the field layout.",
     ],
 ) -> list[AnalyzeBatchResult]:
-    """Run comprehensive analysis over one or more target functions."""
-    queries = normalize_dict_list(queries)
+    """Run comprehensive analysis over one or more target functions.
+
+    Each input produces one result entry with: query, addr, name, and an
+    analysis sub-object. The analysis sub-object always includes size;
+    other sections are present only when you enabled their include_* flag
+    in the input. Disabled sections are null (not missing), so you can
+    safely check `if entry["analysis"]["decompile"] is not None`.
+
+    Typical shapes
+    --------------
+    Cheapest wide scan:
+        analyze_batch(queries=["*sub_4*"])            # filter glob, all
+                                                     # sections except disasm
+    Single function, all sections:
+        analyze_batch(queries="main")
+    A couple of functions, no decompile to save time:
+        analyze_batch(queries=[
+            {"query": "main",       "include_decompile": False},
+            {"query": "check_pw",   "include_decompile": False},
+        ])
+
+    Differences vs. analyze_function / func_profile
+    -----------------------------------------------
+    - analyze_function: one function, everything included by default.
+    - func_profile:     many functions, summary metrics only, no
+                        decompilation. Cheaper.
+    - analyze_batch:    many functions, configurable sections, defaults
+                        to including decompile but skipping disasm.
+    """
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {
+            "query": s,
+            "include_decompile": True,
+            "include_disasm": False,
+            "include_xrefs": True,
+            "include_callers": True,
+            "include_callees": True,
+            "include_strings": True,
+            "include_constants": True,
+            "include_basic_blocks": True,
+            "include_proto": True,
+            "max_disasm_insns": 300,
+            "max_callers": 100,
+            "max_callees": 100,
+            "max_strings": 100,
+            "max_constants": 200,
+            "max_blocks": 500,
+        },
+    )
 
     results: list[dict] = []
     for query in queries:
-        q = str(query.get("addr", "") or "").strip()
+        q = str(query.get("query", "") or query.get("addr", "") or "").strip()
         if not q:
             results.append(
                 {
-                    "target": q,
+                    "query": q,
                     "addr": None,
                     "name": None,
                     "analysis": None,
-                    "error": "addr is required",
+                    "error": "Function query is required",
                 }
             )
             continue
@@ -1062,7 +1224,7 @@ def analyze_batch(
         if err is not None or start_ea is None:
             results.append(
                 {
-                    "target": q,
+                    "query": q,
                     "addr": None,
                     "name": None,
                     "analysis": None,
@@ -1195,7 +1357,7 @@ def analyze_batch(
 
             results.append(
                 {
-                    "target": q,
+                    "query": q,
                     "addr": hex(fn.start_ea),
                     "name": fn_name,
                     "analysis": analysis,
@@ -1205,7 +1367,7 @@ def analyze_batch(
         except Exception as e:
             results.append(
                 {
-                    "target": q,
+                    "query": q,
                     "addr": hex(start_ea),
                     "name": None,
                     "analysis": None,
@@ -1224,10 +1386,26 @@ def analyze_batch(
 @tool
 @idasync
 def xrefs_to(
-    addrs: Annotated[list[str] | str, "Addresses or function names to find cross-references to (e.g. '0x11a9', 'check_pw', 'main')"],
+    addrs: Annotated[
+        list[str] | str,
+        "Addresses or symbol names to find xrefs TO. Accepts hex like '0x11a9', symbol names like 'check_pw' or 'main', or a list/CSV of either."
+    ],
     limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
 ) -> list[XrefsToResult]:
-    """Return xrefs to address(es) or named symbols, capped per target with truncation flag."""
+    """Return xrefs to address(es) or named symbols, capped per target with truncation flag.
+
+    Each result entry contains the input query and the list of xrefs that
+    point TO it, classified as 'code' or 'data' and (when possible) the
+    containing function. Use more=true to detect that the result was
+    truncated by the limit; raise the limit if you need more.
+
+    Differences vs. xref_query
+    --------------------------
+    - xrefs_to: simple list, default 100 xrefs per target, no pagination.
+    - xref_query: filter by direction ('to' / 'from' / 'both') and
+                  xref_type ('any' / 'code' / 'data'), supports offset
+                  and count for pagination, dedup, and sort.
+    """
     addrs = normalize_list_input(addrs)
 
     if limit <= 0 or limit > 1000:
@@ -1261,16 +1439,44 @@ def xrefs_to(
 @idasync
 def xref_query(
     queries: Annotated[
-        list[XrefQuery] | XrefQuery,
-        "Generic xref query with direction/type filters and pagination",
+        list[XrefQuery] | XrefQuery | str,
+        "One query or a list. Each query is an object with query, direction ('to' | 'from' | 'both'), xref_type ('any' | 'code' | 'data'), and pagination (offset, count). A bare string is treated as a single 'both' direction query. A bare object lets you set filters."
     ],
 ) -> list[XrefQueryResult]:
-    """Query xrefs with direction/type filters and pagination."""
-    queries = normalize_dict_list(queries)
+    """Query xrefs with direction/type filters and pagination.
+
+    The result echoes your filters (query, direction, xref_type) and
+    returns a paginated data array plus next_offset/total. Pass
+    next_offset as the offset argument of the next call to continue
+    where you left off.
+
+    Direction semantics
+    -------------------
+    - direction='to':   find xrefs TO the target (callers of, data refs
+                        pointing at). Most common.
+    - direction='from': find xrefs FROM the target (where the target
+                        points to). Useful for tracing a function's
+                        outgoing calls or a pointer's destinations.
+    - direction='both': union of the two above (default).
+    """
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {
+            "query": s,
+            "direction": "both",
+            "xref_type": "any",
+            "offset": 0,
+            "count": 200,
+            "include_fn": True,
+            "dedup": True,
+            "sort_by": "addr",
+            "descending": False,
+        },
+    )
 
     results: list[dict] = []
     for query in queries:
-        q = str(query.get("addr", "")).strip()
+        q = str(query.get("query", "")).strip()
         direction = str(query.get("direction", "both") or "both").lower()
         xref_type = str(query.get("xref_type", "any") or "any").lower()
         offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
@@ -1287,7 +1493,7 @@ def xref_query(
 
         try:
             if not q:
-                raise ValueError("addr is required")
+                raise ValueError("query is required")
             try:
                 target = parse_address(q)
             except Exception:
@@ -1350,7 +1556,7 @@ def xref_query(
             page = paginate(rows, offset, count)
             results.append(
                 {
-                    "target": q,
+                    "query": q,
                     "resolved_addr": hex(target),
                     "direction": direction,
                     "xref_type": xref_type,
@@ -1363,7 +1569,7 @@ def xref_query(
         except Exception as e:
             results.append(
                 {
-                    "target": q,
+                    "query": q,
                     "resolved_addr": None,
                     "direction": direction,
                     "xref_type": xref_type,
@@ -1474,10 +1680,35 @@ def xrefs_to_field(
 @tool
 @idasync
 def callees(
-    addrs: Annotated[list[str] | str, "Function addresses or names to get callees for (e.g. '0x123e', 'main')"],
+    addrs: Annotated[
+        list[str] | str,
+        "Function addresses or names to get callees for (e.g. '0x123e', 'main', or a list/CSV of either)."
+    ],
     limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
 ) -> list[CalleesResult]:
-    """Return unique callees per function, capped by limit."""
+    """Return unique callees per function, capped by limit.
+
+    Walks the function instructions once, deduplicates call targets, and
+    classifies each callee as 'internal' (mapped function in the IDB) or
+    'external' (no function record, e.g. an import or a thunk to a
+    runtime library).
+
+    Differences vs. callgraph
+    -------------------------
+    - callees: direct, one-hop calls from each requested function only.
+    - callgraph: multi-hop traversal with depth, node, and edge budgets
+                 across many roots.
+
+    Differences vs. xrefs_to
+    -----------------------
+    - callees: code references classified by call instruction.
+    - xrefs_to: all references TO an address (code + data), no
+                classification by call instruction.
+
+    Output per function: { addr, callees: [{addr, name, type}], more, error? }
+    more=true means the callee list was truncated by the limit; raise
+    the limit if you need the full fan-out.
+    """
     addrs = normalize_list_input(addrs)
 
     if limit <= 0 or limit > 500:
@@ -1553,16 +1784,420 @@ def callees(
 # ============================================================================
 
 
+def _iter_instruction_operands(insn: ida_ua.insn_t):
+    for index in range(8):
+        op = insn.ops[index]
+        if op.type == ida_ua.o_void:
+            break
+        yield op
+
+
+def _mask_range(mask: list[bool], start: int, count: int) -> None:
+    end = min(len(mask), start + count)
+    for index in range(max(0, start), end):
+        mask[index] = True
+
+
+def _looks_like_relative_branch(insn_bytes: bytes) -> tuple[int, int] | None:
+    if not insn_bytes:
+        return None
+    first = insn_bytes[0]
+    if first in (0xE8, 0xE9) and len(insn_bytes) >= 5:
+        return (1, 4)
+    if first == 0xEB and len(insn_bytes) >= 2:
+        return (1, 1)
+    if 0x70 <= first <= 0x7F and len(insn_bytes) >= 2:
+        return (1, 1)
+    if len(insn_bytes) >= 6 and first == 0x0F and 0x80 <= insn_bytes[1] <= 0x8F:
+        return (2, 4)
+    return None
+
+
+def _mask_instruction_operands(
+    insn: ida_ua.insn_t,
+    insn_bytes: bytes,
+    mask: list[bool],
+    *,
+    wildcard_calls: bool,
+    wildcard_branches: bool,
+    wildcard_rip_relative: bool,
+    wildcard_immediates: bool,
+) -> None:
+    rel_branch = _looks_like_relative_branch(insn_bytes)
+    if rel_branch is not None:
+        start, size = rel_branch
+        if insn_bytes[:1] == b"\xE8" and wildcard_calls:
+            _mask_range(mask, start, size)
+        elif insn_bytes[:1] != b"\xE8" and wildcard_branches:
+            _mask_range(mask, start, size)
+
+    for op in _iter_instruction_operands(insn):
+        offb = int(getattr(op, "offb", 0) or 0)
+        if offb <= 0 or offb >= len(insn_bytes):
+            continue
+
+        if wildcard_immediates and op.type == ida_ua.o_imm:
+            _mask_range(mask, offb, len(insn_bytes) - offb)
+            continue
+
+        if wildcard_rip_relative and op.type in (ida_ua.o_mem, ida_ua.o_displ, ida_ua.o_near, ida_ua.o_far):
+            remaining = len(insn_bytes) - offb
+            if remaining >= 4:
+                _mask_range(mask, len(insn_bytes) - 4, 4)
+
+
+def _format_signature_pattern(raw_bytes: bytes, mask: list[bool]) -> str:
+    parts: list[str] = []
+    for index, value in enumerate(raw_bytes):
+        parts.append("??" if mask[index] else f"{value:02X}")
+    return " ".join(parts)
+
+
+def _count_pattern_matches(pattern: str, max_matches: int = 8) -> tuple[int | None, list[str]]:
+    searcher, error = compat.make_bytes_searcher(pattern)
+    if error is not None:
+        return None, []
+
+    matches: list[str] = []
+    ea = ida_ida.inf_get_min_ea()
+    max_ea = ida_ida.inf_get_max_ea()
+    while ea != idaapi.BADADDR:
+        ea = searcher(ea, max_ea)
+        if ea == idaapi.BADADDR:
+            break
+        matches.append(hex(ea))
+        if len(matches) >= max_matches:
+            break
+        ea += 1
+    return len(matches), matches
+
+
+def _read_pointer(ea: int) -> int:
+    if ida_ida.inf_is_64bit():
+        return int(ida_bytes.get_qword(ea))
+    return int(ida_bytes.get_dword(ea))
+
+
+def _is_function_pointer(ea: int) -> bool:
+    if ea == idaapi.BADADDR or not ida_bytes.is_loaded(ea):
+        return False
+    func = idaapi.get_func(ea)
+    return func is not None and func.start_ea == ea
+
+
+@tool
+@idasync
+def build_signature(
+    addrs: Annotated[
+        list[str] | str,
+        "Addresses or function names to generate hook-friendly byte signatures for",
+    ],
+    use_function_start: Annotated[
+        bool,
+        "Start each signature at the containing function entry instead of the exact address",
+    ] = True,
+    max_instructions: Annotated[
+        int,
+        "Maximum instructions to include in each signature window",
+    ] = 12,
+    max_bytes: Annotated[
+        int,
+        "Maximum bytes to include in each signature window",
+    ] = 96,
+    wildcard_calls: Annotated[
+        bool,
+        "Wildcard relative call targets so signatures survive rel32 changes",
+    ] = True,
+    wildcard_branches: Annotated[
+        bool,
+        "Wildcard relative jump and conditional branch targets",
+    ] = True,
+    wildcard_rip_relative: Annotated[
+        bool,
+        "Wildcard RIP-relative and displacement-heavy operand bytes when detected",
+    ] = True,
+    wildcard_immediates: Annotated[
+        bool,
+        "Wildcard immediate operands when you want broader, less specific signatures",
+    ] = False,
+    uniqueness_limit: Annotated[
+        int,
+        "Maximum module-wide matches to collect while checking whether each pattern is unique",
+    ] = 8,
+) -> list[BuildSignatureResult]:
+    """Generate stable byte signatures for hook points or code anchors.
+
+    Walk forward from the target address (or its containing function start
+    when use_function_start=True) up to max_instructions instructions /
+    max_bytes bytes, mask relative branches, relative call rel32 targets,
+    and RIP-relative displacement bytes, then scan the whole module to
+    report how many times the resulting pattern matches and where.
+
+    Inputs
+    ------
+    addrs: One address or function name, OR a list of either (or a
+        comma-separated string like "0x401000, main"). Each entry is
+        resolved against the IDB independently and produces its own
+        result.
+
+    Outputs (one dict per input address)
+    ------------------------------------
+    - query        : the input string the result corresponds to
+    - addr         : the EA the signature was actually generated from
+    - function_addr / function_name : resolved containing function (or null)
+    - pattern      : space-separated hex bytes, e.g. "48 8B ?? ?? E8 ?? ?? ?? ??"
+                     Use ?? to mean "byte is intentionally wild-carded".
+                     If pattern is null, see the "error" field for the reason.
+    - byte_length  : total bytes covered by the pattern
+    - instruction_count : how many instructions were consumed
+    - wildcard_bytes : how many of byte_length are ??
+    - match_count  : total module-wide matches; capped by uniqueness_limit
+    - unique       : true if match_count == 1
+    - matches      : sample of match addresses (length <= uniqueness_limit)
+    - error        : non-null string if decoding failed for this address
+
+    How to use it
+    -------------
+    - For a stable hook anchor: look for a pattern where unique == true
+      and wildcard_bytes > 0 (so it survives minor rebuild relocations).
+      Copy pattern into your project's signature file (e.g. a sourcemod
+      gamedata entry, a Frida hook, or a Driver module pattern).
+    - For a code pivot: pick a short pattern that includes a few unique
+      constant bytes, then grep your other binaries with find_bytes.
+    - If unique is false: widen the window with max_instructions /
+      max_bytes, or flip wildcard_immediates=true so the pattern
+      generalizes more aggressively (but at the cost of false positives).
+    """
+    addrs = normalize_list_input(addrs)
+    results: list[BuildSignatureResult] = []
+
+    max_instructions = _clamp_int(max_instructions, 12, 1, 64)
+    max_bytes = _clamp_int(max_bytes, 96, 8, 256)
+    uniqueness_limit = _clamp_int(uniqueness_limit, 8, 1, 64)
+
+    for query in addrs:
+        try:
+            ea = resolve_addr(query)
+            func = idaapi.get_func(ea)
+            if use_function_start and func is not None:
+                ea = func.start_ea
+            func = idaapi.get_func(ea)
+
+            cursor = ea
+            chunks: list[bytes] = []
+            mask: list[bool] = []
+            instruction_count = 0
+            total_bytes = 0
+
+            while instruction_count < max_instructions and total_bytes < max_bytes:
+                insn = ida_ua.insn_t()
+                size = ida_ua.decode_insn(insn, cursor)
+                if size <= 0:
+                    break
+                insn_bytes = ida_bytes.get_bytes(cursor, size)
+                if not insn_bytes:
+                    break
+
+                remaining = max_bytes - total_bytes
+                if len(insn_bytes) > remaining:
+                    break
+
+                chunk_mask = [False] * len(insn_bytes)
+                _mask_instruction_operands(
+                    insn,
+                    insn_bytes,
+                    chunk_mask,
+                    wildcard_calls=wildcard_calls,
+                    wildcard_branches=wildcard_branches,
+                    wildcard_rip_relative=wildcard_rip_relative,
+                    wildcard_immediates=wildcard_immediates,
+                )
+
+                chunks.append(insn_bytes)
+                mask.extend(chunk_mask)
+                total_bytes += len(insn_bytes)
+                instruction_count += 1
+                cursor = _next_head(cursor, cursor + size + 1)
+                if cursor == idaapi.BADADDR:
+                    break
+
+            if not chunks:
+                results.append(
+                    {
+                        "query": query,
+                        "addr": None,
+                        "pattern": None,
+                        "matches": [],
+                        "error": "Could not decode any instructions at target",
+                    }
+                )
+                continue
+
+            raw_bytes = b"".join(chunks)
+            pattern = _format_signature_pattern(raw_bytes, mask)
+            match_count, matches = _count_pattern_matches(pattern, max_matches=uniqueness_limit)
+            function_addr = hex(func.start_ea) if func is not None else None
+            function_name = ida_funcs.get_func_name(func.start_ea) if func is not None else None
+            wildcard_bytes = sum(1 for value in mask if value)
+            results.append(
+                {
+                    "query": query,
+                    "addr": hex(ea),
+                    "function_addr": function_addr,
+                    "function_name": function_name,
+                    "pattern": pattern,
+                    "byte_length": len(raw_bytes),
+                    "instruction_count": instruction_count,
+                    "wildcard_bytes": wildcard_bytes,
+                    "match_count": match_count,
+                    "unique": (match_count == 1) if match_count is not None else None,
+                    "matches": matches,
+                    "error": None,
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "query": query,
+                    "addr": None,
+                    "pattern": None,
+                    "matches": [],
+                    "error": str(e),
+                }
+            )
+
+    return results
+
+
+@tool
+@idasync
+def scan_vtables(
+    min_entries: Annotated[
+        int,
+        "Minimum contiguous function-pointer entries for a run to be considered a vtable candidate. Raise to 5-6 to filter weak signals; lower to 2-3 when you suspect small interfaces or stripped binaries."
+    ] = 3,
+    max_results: Annotated[
+        int,
+        "Maximum vtable candidates to return after sorting by signal strength (xref_count, then entry_count, descending)."
+    ] = 50,
+    include_entries: Annotated[
+        int, "How many leading vtable slot entries to include per candidate. Each entry is {slot, addr, name} so you can read the function at each slot."
+    ] = 8,
+    include_xrefs: Annotated[
+        int, "How many xrefs to the table head to include per candidate. Use these to find the class constructor and the sites that consume the vtable."
+    ] = 6,
+) -> list[VtableCandidateResult]:
+    """Scan non-executable segments for contiguous tables of function pointers that look like C++ vtables.
+
+    The scan walks every non-executable segment, looks for runs of
+    pointer-sized words that all resolve to known functions, and treats
+    each run as a vtable candidate. Candidates are sorted by xref_count
+    (then entry_count) and capped to max_results.
+
+    When to use this
+    ---------------
+    - Hunting C++ vtables for hooking or class-hierarchy reconstruction.
+    - Identifying interface tables in stripped binaries.
+    - Reverse-engineering game engines, drivers, or malware object
+      models where slot indices are the only stable anchor.
+
+    Output per candidate: addr, segment, entry_count, xref_count, xrefs
+    (capped), entries (leading slot functions with slot index and
+    resolved name), and an optional error.
+    """
+    min_entries = _clamp_int(min_entries, 3, 2, 64)
+    max_results = _clamp_int(max_results, 50, 1, 200)
+    include_entries = _clamp_int(include_entries, 8, 1, 32)
+    include_xrefs = _clamp_int(include_xrefs, 6, 0, 32)
+    pointer_size = 8 if ida_ida.inf_is_64bit() else 4
+
+    candidates: list[VtableCandidateResult] = []
+    for seg_ea in idautils.Segments():
+        seg = idaapi.getseg(seg_ea)
+        if seg is None or (seg.perm & idaapi.SEGPERM_EXEC):
+            continue
+
+        ea = seg.start_ea
+        while ea + pointer_size <= seg.end_ea:
+            try:
+                target = _read_pointer(ea)
+            except Exception:
+                ea += pointer_size
+                continue
+
+            if not _is_function_pointer(target):
+                ea += pointer_size
+                continue
+
+            entries: list[int] = []
+            cursor = ea
+            while cursor + pointer_size <= seg.end_ea:
+                try:
+                    target = _read_pointer(cursor)
+                except Exception:
+                    break
+                if not _is_function_pointer(target):
+                    break
+                entries.append(target)
+                cursor += pointer_size
+
+            if len(entries) < min_entries:
+                ea += pointer_size
+                continue
+
+            xrefs = [hex(xref.frm) for xref in idautils.XrefsTo(ea, 0)]
+            candidates.append(
+                {
+                    "addr": hex(ea),
+                    "segment": idaapi.get_segm_name(seg) or "",
+                    "entry_count": len(entries),
+                    "xref_count": len(xrefs),
+                    "xrefs": xrefs[:include_xrefs],
+                    "entries": [
+                        {
+                            "slot": index,
+                            "addr": hex(entry),
+                            "name": ida_funcs.get_func_name(entry) or hex(entry),
+                        }
+                        for index, entry in enumerate(entries[:include_entries])
+                    ],
+                    "error": None,
+                }
+            )
+            ea = cursor
+
+    candidates.sort(key=lambda item: (item.get("xref_count", 0), item.get("entry_count", 0)), reverse=True)
+    return candidates[:max_results]
+
+
 @tool
 @idasync
 def find_bytes(
     patterns: Annotated[
-        list[str] | str, "Byte patterns to search for (e.g. '48 8B ?? ??')"
+        list[str] | str, "One IDA-style byte pattern or a list (e.g. '48 8B ?? ??'). Use ?? as the single-byte wildcard; do not put spaces around it. Pass a string for a single search or a list to run several searches in one call."
     ],
     limit: Annotated[int, "Max matches per pattern (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[FindBytesResult]:
-    """Search byte patterns (supports ??) with offset/limit pagination."""
+    """Search raw byte patterns across the whole IDB with offset/limit pagination.
+
+    Use this when you have a known byte sequence (e.g. an opcode sequence
+    produced by build_signature, or a constant table) and want every
+    address where it occurs.
+
+    Differences vs. find
+    --------------------
+    - find_bytes: raw bytes with ?? wildcards. Module-wide scan.
+    - find (type=string): UTF-8 substring search across raw bytes.
+    - find (type=immediate): scan executable segments for an immediate
+      operand value and resolve back to the containing instruction.
+    - find (type=code_ref / data_ref): xref scans from a target address.
+
+    Output per pattern
+    ------------------
+    { pattern, matches: [hex_addrs], n, cursor, error? }
+    If cursor.done is false, pass cursor.next as offset to continue.
+    """
     patterns = normalize_list_input(patterns)
 
     # Enforce max limit
@@ -1644,13 +2279,28 @@ def find_bytes(
 @tool
 @idasync
 def basic_blocks(
-    addrs: Annotated[list[str] | str, "Function addresses or names to get basic blocks for (e.g. '0x123e', 'main')"],
+    addrs: Annotated[
+        list[str] | str,
+        "Function addresses or names to get CFG blocks for (e.g. '0x123e', 'main', or a list/CSV of either)."
+    ],
     max_blocks: Annotated[
         int, "Max basic blocks per function (default: 1000, max: 10000)"
     ] = 1000,
     offset: Annotated[int, "Skip first N blocks (default: 0)"] = 0,
 ) -> list[BasicBlocksResult]:
-    """Return function CFG blocks with offset/max_blocks pagination."""
+    """Return function CFG blocks with offset/max_blocks pagination.
+
+    Each block includes start, end, size, type (entry / sub / ret /
+    normal / etc), and successor/predecessor block addresses. Use the
+    cursor in the response to keep paginating if the function has more
+    than max_blocks.
+
+    Differences vs. analyze_function / analyze_batch
+    -----------------------------------------------
+    - basic_blocks: only CFG blocks. Cheapest option for one function.
+    - analyze_function / analyze_batch: include basic blocks as one
+      field among many; prefer those when you also want pseudocode.
+    """
     addrs = normalize_list_input(addrs)
 
     # Enforce max limit
@@ -1725,15 +2375,26 @@ def basic_blocks(
 @idasync
 def find(
     type: Annotated[
-        str, "Search type: 'string', 'immediate', 'data_ref', or 'code_ref'"
+        str,
+        "Search type. Pick the one that matches your input: 'string' for substring search across the binary, 'immediate' for an integer value used as an instruction operand, 'data_ref' for data xrefs TO a target address, 'code_ref' for code xrefs TO a target address.",
     ],
     targets: Annotated[
-        list[str | int] | str | int, "Search targets (strings, integers, or addresses)"
+        list[str | int] | str | int,
+        "One target or a list. 'string' expects a literal substring; 'immediate' expects an integer (decimal or 0x..); 'data_ref' / 'code_ref' expect an address (hex string) or symbol name."
     ],
     limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[FindResult]:
-    """Search strings/immediates/refs for targets with offset/limit pagination."""
+    """Search strings/immediates/refs for targets with offset/limit pagination.
+
+    Pick the type argument to match your input. For a raw byte search
+    with wildcards, use find_bytes instead. For a structured instruction
+    query, use insn_query.
+
+    Returns one result per target. Each result has matches (list of hex
+    addresses), count, cursor (use cursor.next as offset to continue
+    when cursor.done is false), and an optional error.
+    """
     if not isinstance(targets, list):
         targets = [targets]
 
@@ -2104,12 +2765,36 @@ def _scan_insn_ranges(
 @idasync
 def insn_query(
     queries: Annotated[
-        list[InsnPattern] | InsnPattern,
-        "Instruction query with mnemonic/operand filters and scoped scan",
+        list[InsnPattern] | InsnPattern | str,
+        "One instruction filter or a list. Each filter needs a scope: pick exactly one of func, segment, or start/end. Use allow_broad=true only when you really want to scan every executable segment. A bare string is treated as a mnemonic filter for the whole binary (broad)."
     ],
 ) -> list[InsnQueryResult]:
-    """Query instructions with mnemonic/operand filters and scoped scans."""
-    queries = normalize_dict_list(queries)
+    """Query instructions with mnemonic/operand filters and scoped scans.
+
+    Use this when you want to find every instruction that matches a
+    pattern (e.g. all 'mov' with op0 == some_value, all 'call' with a
+    specific immediate, or every 'xor' in a function). Always set a
+    scope to keep the scan cheap.
+
+    Differences vs. find
+    --------------------
+    - find (type=immediate): fast raw-byte search for an immediate value.
+    - insn_query: filters on the decoded instruction — mnemonic plus
+                  decoded operand values. Slower, but matches the
+                  disassembly you see in IDA.
+    """
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {
+            "mnem": s,
+            "offset": 0,
+            "count": 100,
+            "max_scan_insns": 200000,
+            "allow_broad": False,
+            "include_fn": False,
+            "include_disasm": False,
+        },
+    )
 
     results: list[dict] = []
     for pattern in queries:
@@ -2222,12 +2907,20 @@ def insn_query(
 @tool
 @idasync
 def export_funcs(
-    addrs: Annotated[list[str] | str, "Function addresses or names to export (e.g. '0x123e', 'main')"],
+    addrs: Annotated[list[str] | str, "Function addresses or names to export (e.g. '0x123e', 'main', or a list/CSV of either)."],
     format: Annotated[
-        str, "Export format: json (default), c_header, or prototypes"
+        str, "Output format. 'json' returns the full record per function (prototype, asm, code, xrefs, comments). 'c_header' returns a single C header string of prototype declarations. 'prototypes' returns just the prototype lines as a list."
     ] = "json",
 ) -> ExportFuncsJsonResult | ExportFuncsHeaderResult | ExportFuncsPrototypesResult:
-    """Export function data for addresses in json/c_header/prototypes formats."""
+    """Export function data for addresses in json/c_header/prototypes formats.
+
+    Output shape depends on format:
+    - json:        {format, functions: [{addr, name, prototype, size,
+                    comments, asm, code, xrefs, error?}, ...]}
+    - c_header:    {format, content: '// Auto-generated by IDA Pro MCP\\n
+                    int __cdecl main(...);\\n...'}
+    - prototypes:  {format, functions: [{name, prototype}, ...]}
+    """
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -2287,9 +2980,10 @@ def export_funcs(
 @idasync
 def callgraph(
     roots: Annotated[
-        list[str] | str, "Root function addresses to start call graph traversal from"
+        list[str] | str,
+        "One or more root function addresses/names to start call graph traversal from. For a multi-hop graph pick a high-level root; for a single fan-out, pass the function of interest directly."
     ],
-    max_depth: Annotated[int, "Maximum depth for call graph traversal"] = 5,
+    max_depth: Annotated[int, "Maximum traversal depth. depth=0 keeps only the roots; depth=1 includes direct callees; raise to explore deeper call chains."] = 5,
     max_nodes: Annotated[
         int, "Max nodes across the graph (default: 1000, max: 100000)"
     ] = 1000,
@@ -2300,7 +2994,25 @@ def callgraph(
         int, "Max edges per function (default: 200, max: 5000)"
     ] = 200,
 ) -> list[CallGraphResult]:
-    """Build bounded callgraph from roots with depth/node/edge limits."""
+    """Build a bounded callgraph from one or more roots.
+
+    The graph follows call references downward (callees only — not
+    callers). If you also need callers, use xref_query with
+    direction='to' or look up call sites with xrefs_to.
+
+    Limits are enforced strictly: when a limit is hit, truncated=true
+    and limit_reason names which one ('nodes', 'edges', or implicit
+    per-function cap). If you see truncated=true, raise the relevant
+    limit and re-run.
+
+    Differences vs. trace_data_flow
+    ------------------------------
+    - callgraph: code-only call edges, depth-bounded, with node/edge
+                 caps for predictable cost.
+    - trace_data_flow: both code and data xrefs in one pass; useful
+                 when you want to follow a constant, string, or
+                 global through every reference.
+    """
     roots = normalize_list_input(roots)
     if max_depth < 0:
         max_depth = 0

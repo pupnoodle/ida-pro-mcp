@@ -19,16 +19,13 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
 ]
 dependencies = [
-    "idapro>=0.0.9",
+    "idapro>=0.0.7",
     "tomli-w>=1.0.0",
 ]
 
 [dependency-groups]
 dev = [
     "coverage>=7.13.4",
-    "jsonschema>=4.0",
-    "mcp>=1.0",
-    "pytest>=9.0.3",
 ]
 
 [project.urls]
@@ -41,9 +38,8 @@ build-backend = "setuptools.build_meta"
 
 [project.scripts]
 ida-pro-mcp = "ida_pro_mcp.server:main"
-idalib-mcp = "ida_pro_mcp.idalib_supervisor:main"
+idalib-mcp = "ida_pro_mcp.idalib_server:main"
 ida-mcp-test = "ida_pro_mcp.test:main"
-ida-mcp-trace-dump = "ida_pro_mcp.trace_dump:main"
 
 [tool.pyright]
 include = ["src/ida_pro_mcp"]

@@ -1,10 +1,12 @@
 """Tests for the discovery API module (api_discovery.py).
 
 Tests dispatch routing decisions, loop prevention, select_instance state
-machine and tools/list merge logic.
+machine, tools/list merge logic, and IDB file discovery.
 """
 
 import json
+import os
+import tempfile
 
 from ..framework import test
 from .. import api_discovery
@@ -104,6 +106,56 @@ class _RecordingConnection:
 
     def close(self):
         pass
+
+
+# ---------------------------------------------------------------------------
+# IDB file discovery
+# ---------------------------------------------------------------------------
+
+
+@test()
+def test_find_existing_idb_prefers_i64_over_idb():
+    """_find_existing_idb prefers .i64 over .idb when both exist."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = os.path.join(tmp, "sample")
+        binary = base + ".exe"
+        i64 = base + ".i64"
+        idb = base + ".idb"
+        for path in (binary, i64, idb):
+            with open(path, "w") as f:
+                f.write("")
+        assert api_discovery._find_existing_idb(binary) == i64
+
+
+@test()
+def test_find_existing_idb_returns_none_when_missing():
+    """_find_existing_idb returns None when no IDB exists."""
+    with tempfile.TemporaryDirectory() as tmp:
+        binary = os.path.join(tmp, "sample.exe")
+        with open(binary, "w") as f:
+            f.write("")
+        assert api_discovery._find_existing_idb(binary) is None
+
+
+@test()
+def test_matches_binary_query_by_basename_and_path():
+    """_matches_binary_query accepts basename and full input path forms."""
+    inst = {
+        "binary": "client.so",
+        "module": "client.so",
+        "idb_path": r"C:\tf2\bin\client.i64",
+        "input_path": r"C:\tf2\bin\client.so",
+    }
+    assert api_discovery._matches_binary_query(inst, "client.so")
+    assert api_discovery._matches_binary_query(inst, r"C:\tf2\bin\client.so")
+    assert api_discovery._matches_binary_query(inst, r"C:\tf2\bin\client.i64")
+
+
+@test()
+def test_instance_ready_from_health_requires_auto_analysis():
+    """Ready stays false while auto-analysis is still running."""
+    assert api_discovery._instance_ready_from_health({"auto_analysis_ready": False}) is False
+    assert api_discovery._instance_ready_from_health({"auto_analysis_ready": True, "hexrays_ready": True}) is True
 
 
 # ---------------------------------------------------------------------------

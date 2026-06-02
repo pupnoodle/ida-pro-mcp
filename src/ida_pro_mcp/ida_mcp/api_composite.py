@@ -9,6 +9,7 @@ from .rpc import tool, unsafe
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
     parse_address,
+    resolve_addr,
     get_function,
     get_prototype,
     get_callees,
@@ -126,21 +127,38 @@ class TraceDataFlowResult(TypedDict, total=False):
     error: str
 
 
+class PortingDependency(TypedDict, total=False):
+    addr: str
+    name: str
+    kind: str
+
+
+class PortingBundleResult(TypedDict, total=False):
+    addr: str
+    name: str
+    prototype: str | None
+    size: int
+    decompiled: str | None
+    decompile_truncated: int
+    assembly: str | None
+    stack_frame: list[dict[str, Any]]
+    strings: list[str]
+    constants: list[dict[str, Any]]
+    callees: list[PortingDependency]
+    callers: list[PortingDependency]
+    xref_summary: dict[str, int]
+    comments: dict[str, Any]
+    sdk_stub: str | None
+    notes: list[str]
+    error: str | None
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers (no @tool — called from within @idasync context)
 # ---------------------------------------------------------------------------
 
-def _resolve_addr(addr: str) -> int:
-    """Resolve address or name to ea. Raises IDAError on failure."""
-    import idaapi
-
-    try:
-        return parse_address(addr)
-    except IDAError:
-        ea = idaapi.get_name_ea(idaapi.BADADDR, addr)
-        if ea == idaapi.BADADDR:
-            raise IDAError(f"Address/name not found: {addr!r}")
-        return ea
+# Local alias kept for backwards compatibility within this module.
+_resolve_addr = resolve_addr
 
 
 def _basic_block_info(ea: int) -> BasicBlockSummary:
@@ -206,6 +224,75 @@ def _compact_strings(raw: list[dict], limit: int = _TOP_STRINGS) -> list[str]:
 def _compact_callees(raw: list[dict]) -> list[str]:
     """Return just callee names/addresses as strings."""
     return [c.get("name") or c.get("addr", "?") for c in raw]
+
+
+def _limit_text_lines(text: str | None, max_lines: int) -> tuple[str | None, int | None]:
+    if text is None:
+        return None, None
+    lines = text.split("\n")
+    total = len(lines)
+    if total <= max_lines:
+        return text, None
+    return "\n".join(lines[:max_lines]), total
+
+
+def _dependency_rows(raw: list[dict], limit: int) -> list[PortingDependency]:
+    rows: list[PortingDependency] = []
+    for item in raw[:limit]:
+        rows.append(
+            {
+                "addr": str(item.get("addr", "")),
+                "name": str(item.get("name") or item.get("addr", "")),
+                "kind": str(item.get("type", "function")),
+            }
+        )
+    return rows
+
+
+def _sanitize_identifier(name: str) -> str:
+    out = []
+    for char in name:
+        if char.isalnum() or char == "_":
+            out.append(char)
+        else:
+            out.append("_")
+    sanitized = "".join(out).strip("_")
+    if not sanitized:
+        sanitized = "reconstructed_function"
+    if sanitized[0].isdigit():
+        sanitized = "_" + sanitized
+    return sanitized
+
+
+def _make_sdk_stub(name: str, prototype: str | None, pseudocode: str | None) -> str:
+    fn_name = _sanitize_identifier(name or "reconstructed_function")
+    signature = prototype.strip() if prototype else f"void {fn_name}(void)"
+    if prototype and "(" in signature:
+        head, _, tail = signature.partition("(")
+        signature = f"{head.strip()}({tail}"
+    elif not prototype:
+        signature = f"void {fn_name}(void)"
+
+    return_head = signature.split("(", 1)[0].strip()
+    return_type = return_head[: -len(fn_name)].strip() if return_head.endswith(fn_name) else ""
+
+    body_lines = [
+        signature,
+        "{",
+        "    // Reconstructed from IDA MCP output for Source SDK style reimplementation.",
+        "    // Port the control flow below, replace engine-only helpers with SDK equivalents,",
+        "    // and validate behavior against the original binary before shipping.",
+    ]
+    if pseudocode:
+        body_lines.append("    /*")
+        for line in pseudocode.split("\n")[:20]:
+            body_lines.append(f"    {line}")
+        body_lines.append("    */")
+    body_lines.append('    AssertMsg(false, "Reconstructed stub still needs logic ported from the original binary");')
+    if return_type and return_type != "void":
+        body_lines.append("    return {};")
+    body_lines.append("}")
+    return "\n".join(body_lines)
 
 
 def _analyze_function_internal(
@@ -643,3 +730,130 @@ def trace_data_flow(
         "nodes": nodes,
         "edges": edges,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool 5 — build_porting_bundle
+# ---------------------------------------------------------------------------
+
+
+@tool
+@idasync
+@tool_timeout(180.0)
+def build_porting_bundle(
+    addr: Annotated[str, "Function address or name to package for source-porting work"],
+    include_asm: Annotated[bool, "Include assembly text alongside decompiled output for validation"] = True,
+    max_decompile_lines: Annotated[int, "Maximum decompiled lines to include in the bundle"] = 220,
+    max_asm_lines: Annotated[int, "Maximum assembly lines to include in the bundle"] = 160,
+    max_stack_vars: Annotated[int, "Maximum stack variables to include in the porting summary"] = 48,
+    max_dependencies: Annotated[int, "Maximum callees and callers to include in the dependency summary"] = 24,
+) -> PortingBundleResult:
+    """Build a reconstruction bundle for porting a function into a codebase such as Source SDK 2013. The result combines prototype, capped pseudocode, optional assembly, stack variables, strings, constants, dependency summaries, and a generated C++ stub skeleton so an agent can start replacing an engine routine instead of re-querying five separate tools. Use this when you want to overwrite or reimplement engine/game functions in your own project while keeping the original behavior traceable back to IDA."""
+    import idaapi
+
+    max_decompile_lines = max(20, min(int(max_decompile_lines), 500))
+    max_asm_lines = max(20, min(int(max_asm_lines), 400))
+    max_stack_vars = max(0, min(int(max_stack_vars), 128))
+    max_dependencies = max(1, min(int(max_dependencies), 128))
+
+    try:
+        ea = _resolve_addr(addr)
+    except IDAError as exc:
+        return {"addr": addr, "error": str(exc)}
+
+    func = idaapi.get_func(ea)
+    if func is None:
+        return {"addr": hex(ea), "error": f"No function at {hex(ea)}"}
+
+    start_ea = func.start_ea
+    result: PortingBundleResult = {
+        "addr": hex(start_ea),
+        "name": idaapi.get_func_name(start_ea) or "",
+        "prototype": get_prototype(func),
+        "size": func.end_ea - func.start_ea,
+        "strings": [],
+        "constants": [],
+        "callees": [],
+        "callers": [],
+        "stack_frame": [],
+        "xref_summary": {"to": 0, "from": 0},
+        "comments": {},
+        "notes": [],
+        "error": None,
+    }
+
+    try:
+        raw_code = decompile_function_safe(start_ea)
+        code, total_lines = _limit_text_lines(raw_code, max_decompile_lines)
+        result["decompiled"] = code
+        if total_lines is not None:
+            result["decompile_truncated"] = total_lines
+            result["notes"].append(
+                f"Decompiled output truncated to {max_decompile_lines} lines from {total_lines} total lines."
+            )
+    except Exception as exc:
+        result["decompiled"] = None
+        result["notes"].append(f"Decompiler failed: {exc}")
+
+    if include_asm:
+        try:
+            asm_lines = get_assembly_lines(start_ea)
+            asm_text, total_asm_lines = _limit_text_lines(asm_lines, max_asm_lines)
+            result["assembly"] = asm_text
+            if total_asm_lines is not None:
+                result["notes"].append(
+                    f"Assembly output truncated to {max_asm_lines} lines from {total_asm_lines} total lines."
+                )
+        except Exception as exc:
+            result["assembly"] = None
+            result["notes"].append(f"Assembly export failed: {exc}")
+    else:
+        result["assembly"] = None
+
+    try:
+        result["stack_frame"] = get_stack_frame_variables_internal(start_ea, False)[:max_stack_vars]
+    except Exception as exc:
+        result["notes"].append(f"Stack frame extraction failed: {exc}")
+
+    try:
+        result["strings"] = _compact_strings(extract_function_strings(start_ea), limit=24)
+    except Exception as exc:
+        result["notes"].append(f"String extraction failed: {exc}")
+
+    try:
+        result["constants"] = _filter_constants(extract_function_constants(start_ea), limit=24)
+    except Exception as exc:
+        result["notes"].append(f"Constant extraction failed: {exc}")
+
+    try:
+        callees = get_callees(hex(start_ea)) or []
+        callers = get_callers(hex(start_ea)) or []
+        result["callees"] = _dependency_rows(callees, max_dependencies)
+        result["callers"] = _dependency_rows(callers, max_dependencies)
+    except Exception as exc:
+        result["notes"].append(f"Dependency extraction failed: {exc}")
+
+    try:
+        xrefs = get_all_xrefs(start_ea)
+        result["comments"] = get_all_comments(start_ea)
+        result["xref_summary"] = {
+            "to": len(list(xrefs.get("to", []))),
+            "from": len(list(xrefs.get("from", []))),
+        }
+    except Exception as exc:
+        result["notes"].append(f"Xref/comment extraction failed: {exc}")
+
+    result["sdk_stub"] = _make_sdk_stub(
+        result["name"],
+        result["prototype"],
+        result.get("decompiled"),
+    )
+
+    if result["prototype"] is None:
+        result["notes"].append("Prototype is missing or weak; verify calling convention before porting.")
+    if not result["stack_frame"]:
+        result["notes"].append("No stack-frame variables were recovered; expect manual local-variable cleanup.")
+    if not result["strings"] and not result["constants"]:
+        result["notes"].append("Function has little literal signal; validate logic carefully against assembly.")
+
+    return result

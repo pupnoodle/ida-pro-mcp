@@ -1,3 +1,5 @@
+this repository is basically all made by codex i did not touch this codebase its only for my own personal projects just publishing it because why not
+
 # IDA Pro MCP
 
 Simple [MCP Server](https://modelcontextprotocol.io/introduction) to allow vibe reversing in IDA Pro.
@@ -22,7 +24,7 @@ The binaries and prompt for the video are available in the [mcp-reversing-datase
   - [Crush](https://github.com/charmbracelet/crush)
   - [Cursor](https://cursor.com)
   - [Gemini CLI](https://google-gemini.github.io/gemini-cli/)
-  - [Kilo Code](https://kilo.ai/)
+  - [Kilo Code](https://www.kilocode.com/)
   - [Kiro](https://kiro.dev/)
   - [LM Studio](https://lmstudio.ai/)
   - [Opencode](https://opencode.ai/)
@@ -37,35 +39,9 @@ The binaries and prompt for the video are available in the [mcp-reversing-datase
   - [Zed](https://zed.dev/)
   - [Other MCP Clients](https://modelcontextprotocol.io/clients#example-clients): Run `ida-pro-mcp --config` to get the JSON config for your client.
 
-## Installation (Claude Code)
+## Installation
 
-To install the headless IDA Pro MCP in Claude Code:
-
-```bash
-claude plugin marketplace add mrexodia/claude-marketplace
-claude plugin install ida-pro-mcp@mrexodia
-```
-
-To update to the latest version:
-
-```bash
-claude plugin update ida-pro-mcp@mrexodia
-```
-
-**Note**: This requires having idalib activated globally and [uv](https://astral.sh/uv) installed:
-
-```bash
-# windows
-uv run "C:\Program Files\IDA Professional 9.3\idalib\python\py-activate-idalib.py"
-# macos
-uv run "/Applications/IDA Professional 9.3.app/Contents/MacOS/idalib/python/py-activate-idalib.py"
-```
-
-## Installation (GUI)
-
-**Note**: the MCP plugin is no longer recommended and will eventually be deprecated. Use `idalib-mcp` instead.
-
-If you want to configure the MCP server manually from the IDA GUI:
+Install the latest version of the IDA Pro MCP package:
 
 ```sh
 pip uninstall ida-pro-mcp
@@ -78,7 +54,17 @@ Configure the MCP servers and install the IDA Plugin:
 ida-pro-mcp --install
 ```
 
+If IDA is installed in a non-default location, pass it explicitly:
+
+```sh
+ida-pro-mcp --install --ida-dir "C:\Users\kel\Documents\ida9.3"
+```
+
 **Important**: Make sure you completely restart IDA and your MCP client for the installation to take effect. Some clients (like Claude) run in the background and need to be quit from the tray icon.
+
+https://github.com/user-attachments/assets/65ed3373-a187-4dd5-a807-425dca1d8ee9
+
+_Note_: You need to load a binary in IDA before the plugin menu will show up.
 
 ## Prompt Engineering
 
@@ -152,7 +138,7 @@ Another thing to keep in mind is that LLMs will not perform well on obfuscated c
 
 You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
 
-## Transports & Headless MCP
+## SSE Transport & Headless MCP
 
 You can run an SSE server to connect to the user interface like this:
 
@@ -160,61 +146,15 @@ You can run an SSE server to connect to the user interface like this:
 uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
 ```
 
-After installing [`idalib`](https://docs.hex-rays.com/core/idalib/getting-started) you can also run a headless MCP server. You can start with an initial binary:
+After installing [`idalib`](https://docs.hex-rays.com/user-guide/idalib) you can also run a headless SSE server:
 
 ```sh
 uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
 ```
 
-Or start without a binary and open/close arbitrary files later with `idalib_open(...)` / `idalib_close(...)`:
-
-```sh
-uv run idalib-mcp --host 127.0.0.1 --port 8745
-```
-
-For stdio-based clients, use:
-
-```sh
-uv run idalib-mcp --stdio
-```
-
-`--stdio` keeps database state inside that MCP server process. For stdio clients
-that spawn separate MCP server processes, such as Codex sub-agents, use
-`--stdio-shared` instead:
-
-```sh
-uv run idalib-mcp --stdio-shared
-```
-
-`--stdio-shared` starts or reuses a shared local HTTP supervisor on the
-configured host/port and proxies stdio JSON-RPC to it, so separate stdio MCP
-processes can share the same opened database workers.
-
 _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
 
 ## Headless idalib Session Model
-
-`idalib-mcp` is a supervisor that keeps each open database in its own idalib worker process. Starting without an `input_path` is supported; use `idalib_open(input_path, ...)` to open databases dynamically and `idalib_close(session_id)` to close them. This allows one headless MCP server to work with arbitrary files over its lifetime.
-
-If the requested IDB is already open in a GUI IDA instance running the plugin, `idalib-mcp` will use that GUI instance instead of spawning a duplicate headless worker. If the GUI instance later disappears, the next routed request reopens the database in a headless worker when possible. Unsaved GUI-only changes must be saved first if they should be visible after fallback.
-
-Tools target either the database bound to the current MCP context or an explicit `database` argument.
-
-```sh
-uv run idalib-mcp --stdio --max-workers 4
-```
-
-Typical flow:
-
-```python
-idalib_open("/path/to/binary_a.exe", session_id="binary_a")
-idalib_open("/path/to/library.dll", session_id="library")
-
-decompile("main", database="binary_a")
-xrefs_to("ImportantExport", database="library")
-```
-
-`database` accepts a session ID, filename, or input path. If omitted, tools use the database bound to the active context.
 
 Use `--isolated-contexts` to enable strict per-transport isolation:
 
@@ -226,14 +166,15 @@ uv run idalib-mcp --isolated-contexts --host 127.0.0.1 --port 8745 path/to/execu
 
 Use it when multiple agents connect to the same `idalib-mcp` server and you want deterministic context isolation:
 
-- Prevent one agent from changing another agent's active database accidentally.
-- Keep each transport context's default database explicit.
-- Still allow intentional collaboration by passing `database=...` or binding multiple agents to the same session ID.
+- Prevent one agent from changing another agent's active session accidentally.
+- Run concurrent analyses safely (for example agent A on binary X and agent B on binary Y).
+- Still allow intentional collaboration by binding multiple agents to the same open session ID.
+- Improve reproducibility because each agent's context binding is explicit.
 
 When `--isolated-contexts` is enabled:
 
 - Each transport context has its own binding (`Mcp-Session-Id` for `/mcp`, `session` for `/sse`, `stdio:default` for stdio).
-- Unbound contexts fail fast for IDB-dependent tools/resources unless `database` is provided.
+- Unbound contexts fail fast for IDB-dependent tools/resources.
 - `idalib_switch(session_id)` and `idalib_open(...)` bind the caller context only.
 
 ### Streamable HTTP behavior
@@ -242,16 +183,11 @@ With `--isolated-contexts`, strict Streamable HTTP session semantics are enabled
 
 ### Context tools
 
-- `idalib_open(input_path, ...)`: Open binary in a worker and bind it to the active context policy.
+- `idalib_open(input_path, ...)`: Open binary and bind it to the active context policy.
 - `idalib_switch(session_id)`: Rebind the active context policy to an existing session.
 - `idalib_current()`: Return the session bound to the active context policy.
 - `idalib_unbind()`: Remove the active context binding.
-- `idalib_list()`: Includes `is_active`, `is_current_context`, `bound_contexts`, backend (`worker` or `gui`), and process IDs.
-
-Worker controls:
-
-- `--max-workers N`: maximum simultaneous database workers (`0` = unlimited, default `4`).
-- `IDA_MCP_MAX_WORKERS`: environment default for `--max-workers`.
+- `idalib_list()`: Includes `is_active`, `is_current_context`, and `bound_contexts`.
 
 
 ## MCP Resources
@@ -395,6 +331,22 @@ http://127.0.0.1:13337/mcp?ext=dbg
 - **Consistent error handling**: All batch operations return `[{..., error: null|string}, ...]`
 - **Cursor-based pagination**: Search functions return `cursor: {next: offset}` or `{done: true}` (default limit: 1000, enforced max: 10000 to prevent token overflow)
 - **Performance**: Strings are cached with MD5-based invalidation to avoid repeated `build_strlist` calls in large projects
+
+## Comparison with other MCP servers
+
+There are a few IDA Pro MCP servers floating around, but I created my own for a few reasons:
+
+1. Installation should be fully automated.
+2. The architecture of other plugins make it difficult to add new functionality quickly (too much boilerplate of unnecessary dependencies).
+3. Learning new technologies is fun!
+
+If you want to check them out, here is a list (in the order I discovered them):
+
+- https://github.com/taida957789/ida-mcp-server-plugin (SSE protocol only, requires installing dependencies in IDAPython).
+- https://github.com/fdrechsler/mcp-server-idapro (MCP Server in TypeScript, excessive boilerplate required to add new functionality).
+- https://github.com/MxIris-Reverse-Engineering/ida-mcp-server (custom socket protocol, boilerplate).
+
+Feel free to open a PR to add your IDA Pro MCP server here.
 
 ## Development
 

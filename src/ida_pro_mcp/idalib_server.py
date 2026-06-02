@@ -3,9 +3,8 @@ import json
 import logging
 import signal
 import sys
-import os
 from pathlib import Path
-from typing import Annotated, Any, NotRequired, Optional, TypedDict
+from typing import Annotated, Any, Optional, TypedDict
 
 # idapro must go first to initialize idalib
 import idapro
@@ -18,16 +17,13 @@ from ida_pro_mcp.ida_mcp.api_core import (
     server_health,
     server_warmup,
 )
-from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile
-from ida_pro_mcp.ida_mcp.rpc import get_current_transport_session_id, set_download_base_url, tool
-from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
+from ida_pro_mcp.ida_mcp.rpc import get_current_transport_session_id, tool
 from ida_pro_mcp.idalib_session_manager import get_session_manager
 
 class IdalibContextFields(TypedDict):
-    # Optional because error paths can fail before a request context is resolved.
-    context_id: NotRequired[str]
-    transport_context_id: NotRequired[str | None]
-    isolated_contexts: NotRequired[bool]
+    context_id: str
+    transport_context_id: str | None
+    isolated_contexts: bool
 
 
 class IdalibSessionInfo(TypedDict):
@@ -38,12 +34,6 @@ class IdalibSessionInfo(TypedDict):
     last_accessed: str
     is_analyzing: bool
     metadata: dict[str, Any]
-
-
-class IdalibSessionListInfo(IdalibSessionInfo, total=False):
-    is_active: bool
-    is_current_context: bool
-    bound_contexts: int
 
 
 class IdalibOpenResult(IdalibContextFields, total=False):
@@ -73,7 +63,7 @@ class IdalibUnbindResult(IdalibContextFields, total=False):
 
 
 class IdalibListResult(IdalibContextFields, total=False):
-    sessions: list[IdalibSessionListInfo]
+    sessions: list[IdalibSessionInfo]
     count: int
     current_context_session_id: str | None
     error: str
@@ -125,7 +115,6 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_health",
     "idalib_warmup",
 }
-IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
 
 _ISOLATED_CONTEXTS_ENABLED = False
 
@@ -504,17 +493,6 @@ def main():
         "--unsafe", action="store_true", help="Enable unsafe functions (DANGEROUS)"
     )
     parser.add_argument(
-        "--profile",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help=(
-            "Restrict exposed tools to those listed in a profile file "
-            "(one name per line, # for comments). idalib_* management tools "
-            "are always kept."
-        ),
-    )
-    parser.add_argument(
         "input_path",
         type=Path,
         nargs="?",
@@ -579,10 +557,6 @@ def main():
     # In isolated mode we require Streamable HTTP session semantics.
     MCP_SERVER.require_streamable_http_session = _ISOLATED_CONTEXTS_ENABLED
 
-    for name in IDALIB_HIDDEN_PLUGIN_TOOLS:
-        MCP_SERVER.tools.methods.pop(name, None)
-    logger.info("GUI-plugin routing tools disabled under idalib")
-
     # Gate unsafe tools: remove them from the registry unless --unsafe is set.
     if not args.unsafe:
         for name in MCP_UNSAFE:
@@ -590,46 +564,12 @@ def main():
         if MCP_UNSAFE:
             logger.info("Unsafe tools disabled (start with --unsafe to enable)")
 
-    if args.profile is not None:
-        try:
-            whitelist = load_profile(args.profile)
-        except (OSError, UnicodeDecodeError) as e:
-            raise SystemExit(f"Failed to read profile '{args.profile}': {e}")
-        kept, unknown = apply_profile(
-            MCP_SERVER.tools.methods,
-            whitelist,
-            protected=IDALIB_MANAGEMENT_TOOLS,
-        )
-        if unknown:
-            logger.warning(
-                "Profile references unknown tool(s) (ignored): %s", ", ".join(unknown)
-            )
-        logger.info(
-            "Profile applied: %d whitelisted + %d management tool(s) active",
-            len(kept),
-            len(IDALIB_MANAGEMENT_TOOLS),
-        )
-
     _install_context_activation_hooks()
-
-    from ida_pro_mcp.ida_mcp import trace
-    trace.install_tracer()
-    logger.info("Tracing tools/call to IDB netnode %s", trace.IDB_NETNODE_NAME)
 
     # NOTE: npx -y @modelcontextprotocol/inspector for debugging
     # TODO: with background=True the main thread does not fake any
     # work from @idasync, so we deadlock.
-    if not "IDA_MCP_URL" in os.environ:
-        # IDA_MCP_URL is used to set download base url by environment,
-        # so we only update download base url if this env var is not
-        # present
-        #
-        # It should be noted that this url ONLY affects the literal string
-        # returned by MCP response, does NOT affect the actual socket
-        # endpoint this server listens to
-        set_download_base_url(f"http://{args.host}:{args.port}")
-    MCP_SERVER.serve(host=args.host, port=args.port, background=False,
-                     request_handler=IdaMcpHttpRequestHandler)
+    MCP_SERVER.serve(host=args.host, port=args.port, background=False)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,12 @@
 """Core API Functions - IDB metadata and basic queries"""
 
-import logging
 import re
 import time
 from typing import Annotated, Any, NotRequired, TypedDict
 
 import ida_auto
-import ida_bytes
 import idaapi
+import ida_bytes
 import ida_funcs
 import ida_hexrays
 import ida_lines
@@ -39,9 +38,6 @@ from .utils import (
     paginate,
     pattern_filter,
 )
-
-
-logger = logging.getLogger(__name__)
 
 
 class ServerHealthResult(TypedDict):
@@ -162,7 +158,7 @@ def init_caches():
     t0 = time.perf_counter()
     strings = _get_strings_cache()
     t1 = time.perf_counter()
-    logger.info("[MCP] Cached %d strings in %.0fms", len(strings), (t1 - t0) * 1000)
+    print(f"[MCP] Cached {len(strings)} strings in {(t1 - t0) * 1000:.0f}ms")
 
 
 # ============================================================================
@@ -535,7 +531,6 @@ def int_convert(
                     ascii=ascii_str,
                     binary=bin(value),
                 ),
-                "error": None,
             }
         )
 
@@ -546,12 +541,14 @@ def int_convert(
 @idasync
 def list_funcs(
     queries: Annotated[
-        list[ListQuery] | ListQuery,
+        list[ListQuery] | ListQuery | str,
         "List functions with optional filtering and pagination",
     ],
 ) -> list[Page[Function]]:
     """List functions with optional filtering and offset/count pagination."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries, lambda s: {"offset": 0, "count": 50, "filter": s}
+    )
     all_functions = [get_function(addr) for addr in idautils.Functions()]
 
     results = []
@@ -574,12 +571,21 @@ def list_funcs(
 @idasync
 def func_query(
     queries: Annotated[
-        list[FunctionQuery] | FunctionQuery,
+        list[FunctionQuery] | FunctionQuery | str,
         "Richer function query (size/type/name filters + pagination)",
     ],
 ) -> list[FunctionQueryPage]:
     """Query functions with richer filtering than list_funcs."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {
+            "filter": s,
+            "offset": 0,
+            "count": 50,
+            "sort_by": "addr",
+            "descending": False,
+        },
+    )
 
     all_functions: list[dict] = []
     for addr in idautils.Functions():
@@ -656,12 +662,14 @@ def func_query(
 @idasync
 def list_globals(
     queries: Annotated[
-        list[ListQuery] | ListQuery,
+        list[ListQuery] | ListQuery | str,
         "List global variables with optional filtering and pagination",
     ],
 ) -> list[Page[Global]]:
     """List globals with optional filtering and offset/count pagination."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries, lambda s: {"offset": 0, "count": 50, "filter": s}
+    )
     all_globals: list[Global] = []
     for addr, name in idautils.Names():
         if not idaapi.get_func(addr) and name is not None:
@@ -687,12 +695,15 @@ def list_globals(
 @idasync
 def entity_query(
     queries: Annotated[
-        list[EntityQuery] | EntityQuery,
+        list[EntityQuery] | EntityQuery | str,
         "Generic entity query with filtering, projection, and pagination",
     ],
 ) -> list[EntityQueryPage]:
     """Query IDB entities with typed filters, projection, and pagination."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {"kind": s, "offset": 0, "count": 100, "sort_by": "addr"},
+    )
     results: list[dict] = []
 
     for query in queries:
@@ -802,12 +813,14 @@ def imports(
 @idasync
 def imports_query(
     queries: Annotated[
-        list[ImportQuery] | ImportQuery,
+        list[ImportQuery] | ImportQuery | str,
         "Import query with import/module filters and pagination",
     ],
 ) -> list[ImportsQueryPage]:
     """Query imports with richer filtering than imports(offset,count)."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries, lambda s: {"filter": s, "offset": 0, "count": 100}
+    )
     all_imports = _collect_imports()
     results = []
 
@@ -955,6 +968,7 @@ def _exec_segments() -> list[tuple[int, int]]:
 
 
 def _all_segments() -> list[tuple[int, int]]:
+    """Return [(start, end)] for every segment in address order."""
     ranges: list[tuple[int, int]] = []
     for seg_ea in idautils.Segments():
         seg = idaapi.getseg(seg_ea)
@@ -979,6 +993,21 @@ def search_text(
     Discovers candidate EAs with `ida_search.find_text()`, then renders each hit
     once via `ida_lines.generate_disassembly()` to extract matching lines and
     classify them as disasm or comment. Returns one hit per EA.
+
+    Differences vs. find(type='string')
+    -----------------------------------
+    - find(type='string'): raw byte substring scan across the IDB. Returns
+      addresses only; doesn't tell you the rendered disasm/comment context.
+    - search_text:        scans the rendered listing, returns each matching
+      line (kind=disasm|comment, text) plus function and segment context.
+
+    Differences vs. insn_query
+    --------------------------
+    - insn_query:    filters on decoded instruction fields (mnemonic + operand
+                    values). Use to find all `mov reg, 0x401000` instructions.
+    - search_text:   filters on the rendered text of the listing (mnemonic +
+                    operand rendered strings + comments). Use to find a string
+                    like 'check_password' in disasm or comments.
     """
     if limit <= 0:
         limit = 30

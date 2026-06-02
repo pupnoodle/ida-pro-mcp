@@ -10,12 +10,26 @@ import sys
 from ..framework import test
 
 try:
-    from ida_pro_mcp.installer import generate_mcp_config, SERVER_SCRIPT, IDA_HOST, IDA_PORT
+    from ida_pro_mcp.installer import (
+        generate_mcp_config,
+        SERVER_SCRIPT,
+        IDA_HOST,
+        IDA_PORT,
+        _resolve_ida_plugin_dir,
+        _resolve_ida_root_dir,
+    )
 except ImportError:
     _parent = os.path.join(os.path.dirname(__file__), "..", "..")
     sys.path.insert(0, _parent)
     try:
-        from installer import generate_mcp_config, SERVER_SCRIPT, IDA_HOST, IDA_PORT
+        from installer import (
+            generate_mcp_config,
+            SERVER_SCRIPT,
+            IDA_HOST,
+            IDA_PORT,
+            _resolve_ida_plugin_dir,
+            _resolve_ida_root_dir,
+        )
     finally:
         sys.path.remove(_parent)
 
@@ -72,3 +86,26 @@ def test_claude_http_config_has_type_field():
     config = generate_mcp_config(client_name="Claude", transport="streamable-http")
     assert config.get("type") == "http"
     assert "url" in config
+
+
+@test()
+def test_resolve_ida_plugin_dir_accepts_install_root():
+    """Explicit install roots resolve to their plugins subdirectory."""
+    install_root = os.path.join("C:\\", "Users", "kel", "Documents", "ida9.3")
+    expected = os.path.join(install_root, "plugins")
+    assert _resolve_ida_plugin_dir(install_root) == expected
+
+
+@test()
+def test_resolve_ida_plugin_dir_accepts_plugins_dir():
+    """Explicit plugins directories are preserved as-is."""
+    plugins_dir = os.path.join("C:\\", "Users", "kel", "Documents", "ida9.3", "plugins")
+    assert _resolve_ida_plugin_dir(plugins_dir) == plugins_dir
+
+
+@test()
+def test_resolve_ida_root_dir_from_plugins_dir():
+    """Explicit plugins directories map back to their containing IDA root."""
+    plugins_dir = os.path.join("C:\\", "Users", "kel", "Documents", "ida9.3", "plugins")
+    expected = os.path.dirname(plugins_dir)
+    assert _resolve_ida_root_dir(plugins_dir) == expected

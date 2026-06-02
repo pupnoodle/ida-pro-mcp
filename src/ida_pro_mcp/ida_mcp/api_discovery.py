@@ -12,11 +12,9 @@ import subprocess
 import sys
 import threading
 import time
-from collections import OrderedDict
 from typing import Annotated, NotRequired, TypedDict
 
 from .rpc import tool, MCP_SERVER
-from .zeromcp import EXTERNAL_BASE_HEADER, get_current_request_external_base_url
 from .discovery import discover_instances, probe_instance
 
 
@@ -34,9 +32,27 @@ class InstanceListItem(TypedDict, total=False):
     pid: int
     binary: str
     idb_path: str
+    input_path: str
     started_at: str
     reachable: bool
     active: bool
+    auto_analysis_ready: bool | None
+    hexrays_ready: bool | None
+    ready: bool | None
+
+
+class InstanceHealthResult(TypedDict, total=False):
+    host: str
+    port: int
+    reachable: bool
+    status: str | None
+    idb_path: str | None
+    input_path: str | None
+    module: str | None
+    auto_analysis_ready: bool | None
+    hexrays_ready: bool | None
+    ready: bool | None
+    error: str | None
 
 
 class OpenFileResult(TypedDict, total=False):
@@ -48,6 +64,9 @@ class OpenFileResult(TypedDict, total=False):
     switched: bool
     message: str
     error: str
+    used_existing: bool
+    target_path: str | None
+    ready: bool | None
 
 
 # Track which instance this server is (filled in by the plugin loader)
@@ -64,7 +83,13 @@ _redirect_targets: dict[str, tuple[str, int]] = {}
 _redirect_lock = threading.Lock()
 
 # Tools that are always handled locally, never proxied
-_LOCAL_TOOL_NAMES = {"list_instances", "select_instance", "open_file"}
+_LOCAL_TOOL_NAMES = {
+    "list_instances",
+    "instance_health",
+    "select_instance",
+    "select_binary",
+    "open_file",
+}
 
 
 def set_local_instance(host: str, port: int):
@@ -130,46 +155,6 @@ def is_local_tool(name: str) -> bool:
 
 
 PROXY_HEADER = "X-MCP-Proxied"
-OUTPUT_PROXY_CACHE_MAX_SIZE = 100
-_output_proxy_targets: OrderedDict[str, tuple[str, int]] = OrderedDict()
-_output_proxy_lock = threading.Lock()
-
-
-def _extract_output_id(response: dict) -> str | None:
-    result = response.get("result")
-    if not isinstance(result, dict):
-        return None
-    meta = result.get("_meta")
-    if not isinstance(meta, dict):
-        return None
-    ida_meta = meta.get("ida_mcp")
-    if not isinstance(ida_meta, dict):
-        return None
-    output_id = ida_meta.get("output_id")
-    return output_id if isinstance(output_id, str) else None
-
-
-def _remember_output_proxy_target(output_id: str, host: str, port: int) -> None:
-    with _output_proxy_lock:
-        _output_proxy_targets.pop(output_id, None)
-        _output_proxy_targets[output_id] = (host, port)
-        while len(_output_proxy_targets) > OUTPUT_PROXY_CACHE_MAX_SIZE:
-            _output_proxy_targets.popitem(last=False)
-
-
-def get_output_proxy_target(output_id: str) -> tuple[str, int] | None:
-    with _output_proxy_lock:
-        target = _output_proxy_targets.get(output_id)
-        if target is None:
-            return None
-        _output_proxy_targets.move_to_end(output_id)
-        return target
-
-
-def _remember_output_proxy_target_from_response(host: str, port: int, response: dict) -> None:
-    output_id = _extract_output_id(response)
-    if output_id:
-        _remember_output_proxy_target(output_id, host, port)
 
 
 def _get_proxy_request_path() -> str:
@@ -191,9 +176,6 @@ def _get_proxy_request_headers() -> dict[str, str]:
         session_id = transport_session_id.split(":", 1)[1]
         if session_id and session_id != "anonymous":
             headers["Mcp-Session-Id"] = session_id
-    external_base_url = get_current_request_external_base_url()
-    if external_base_url:
-        headers[EXTERNAL_BASE_HEADER] = external_base_url
     return headers
 
 
@@ -215,24 +197,109 @@ def proxy_to_instance(host: str, port: int, payload: bytes) -> dict:
         raw_data = response.read().decode()
         if response.status >= 400:
             raise RuntimeError(f"HTTP {response.status} {response.reason}: {raw_data}")
-        parsed = json.loads(raw_data)
-        _remember_output_proxy_target_from_response(host, port, parsed)
-        return parsed
+        return json.loads(raw_data)
     finally:
         conn.close()
 
 
-def proxy_output_to_instance(
-    host: str, port: int, path: str
-) -> tuple[int, str, list[tuple[str, str]], bytes]:
-    """Forward an output download request to another IDA instance."""
-    conn = http.client.HTTPConnection(host, port, timeout=30)
+def _call_instance_tool(
+    host: str, port: int, name: str, arguments: dict | None = None
+) -> dict:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments or {}},
+    }
+    response = proxy_to_instance(host, port, json.dumps(payload).encode("utf-8"))
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "Unknown proxy error"))
+    result = response.get("result", {})
+    if result.get("isError"):
+        content = result.get("content", [])
+        if content:
+            raise RuntimeError(content[0].get("text", "Unknown tool error"))
+        raise RuntimeError("Unknown tool error")
+    return result.get("structuredContent", {})
+
+
+def _normalize_path(path: str | None) -> str:
+    if not path:
+        return ""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _matches_binary_query(inst: dict, query: str) -> bool:
+    normalized_query = _normalize_path(query)
+    query_lower = query.strip().lower()
+    candidates = [
+        inst.get("binary"),
+        inst.get("module"),
+        inst.get("idb_path"),
+        inst.get("input_path"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_lower = str(candidate).strip().lower()
+        if candidate_lower == query_lower:
+            return True
+        if os.path.basename(candidate_lower) == query_lower:
+            return True
+        if normalized_query and _normalize_path(str(candidate)) == normalized_query:
+            return True
+    return False
+
+
+def _instance_ready_from_health(health: dict | None) -> bool | None:
+    if not isinstance(health, dict):
+        return None
+    auto_ready = health.get("auto_analysis_ready")
+    if auto_ready is False:
+        return False
+    if auto_ready is None:
+        return None
+    hexrays_ready = health.get("hexrays_ready")
+    if hexrays_ready is False:
+        return False
+    return True
+
+
+def _probe_instance_health(host: str, port: int) -> InstanceHealthResult:
     try:
-        conn.request("GET", path, headers={PROXY_HEADER: "1"})
-        response = conn.getresponse()
-        return response.status, response.reason, response.getheaders(), response.read()
-    finally:
-        conn.close()
+        health = _call_instance_tool(host, port, "server_health", {})
+        return {
+            "host": host,
+            "port": port,
+            "reachable": True,
+            "status": health.get("status"),
+            "idb_path": health.get("idb_path"),
+            "input_path": health.get("input_path"),
+            "module": health.get("module"),
+            "auto_analysis_ready": health.get("auto_analysis_ready"),
+            "hexrays_ready": health.get("hexrays_ready"),
+            "ready": _instance_ready_from_health(health),
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "host": host,
+            "port": port,
+            "reachable": False,
+            "ready": None,
+            "error": str(e),
+        }
+
+
+def _wait_until_instance_ready(host: str, port: int, timeout: int) -> InstanceHealthResult:
+    deadline = time.monotonic() + max(0, timeout)
+    last = _probe_instance_health(host, port)
+    while time.monotonic() < deadline:
+        if last.get("ready") is True:
+            return last
+        time.sleep(1.0)
+        last = _probe_instance_health(host, port)
+    return last
 
 
 # ============================================================================
@@ -339,26 +406,37 @@ MCP_SERVER.registry.dispatch = _redirecting_dispatch
 
 @tool
 def list_instances() -> list[InstanceListItem]:
-    """List all discovered IDA Pro instances with their binary name, port, and reachability status.
-
-    Use this to see which IDA databases are currently open and available for analysis.
-    The 'active' field indicates which instance is currently handling your tool calls.
-    """
+    """List discovered IDA instances and include readiness for the currently loaded database. Use this to see which binary or IDB each instance has open, whether it is reachable, and whether auto-analysis plus Hex-Rays are ready enough for model work. The 'active' field indicates which instance will receive tool calls right now, while 'ready' helps avoid switching into a half-loaded database."""
     instances = discover_instances()
     result = []
     redirect = get_redirect_target()
     for inst in instances:
         reachable = probe_instance(inst["host"], inst["port"])
+        health = _probe_instance_health(inst["host"], inst["port"]) if reachable else {}
         if redirect:
             active = inst["host"] == redirect[0] and inst["port"] == redirect[1]
         else:
             active = inst["host"] == _LOCAL_HOST and inst["port"] == _LOCAL_PORT
         result.append({
             **inst,
+            "idb_path": health.get("idb_path") or inst.get("idb_path", ""),
+            "input_path": health.get("input_path", ""),
             "reachable": reachable,
             "active": active,
+            "auto_analysis_ready": health.get("auto_analysis_ready"),
+            "hexrays_ready": health.get("hexrays_ready"),
+            "ready": health.get("ready"),
         })
     return result
+
+
+@tool
+def instance_health(
+    host: Annotated[str, "Host address of the IDA instance to probe"] = "127.0.0.1",
+    port: Annotated[int, "Port number of the IDA instance to probe"] = 13337,
+) -> InstanceHealthResult:
+    """Probe one IDA instance and report whether its current database is actually ready for model analysis. This wraps server_health on the target instance and exposes the loaded input path, IDB path, auto-analysis readiness, Hex-Rays readiness, and a combined 'ready' flag. Use this before expensive reverse-engineering work when the agent just opened or switched databases."""
+    return _probe_instance_health(host, port)
 
 
 @tool
@@ -399,6 +477,7 @@ def _find_existing_idb(file_path: str) -> str | None:
     Opening the IDB directly skips the packed/unpacked dialog.
     """
     base = os.path.splitext(file_path)[0]
+    # Prefer .i64 (64-bit) over .idb (32-bit)
     for ext in (".i64", ".idb"):
         idb_path = base + ext
         if os.path.isfile(idb_path):
@@ -407,7 +486,13 @@ def _find_existing_idb(file_path: str) -> str | None:
 
 
 def _get_ida_executable() -> str:
-    """Return the executable path for the current IDA process."""
+    """Return the executable path for the current IDA process.
+
+    On Linux, sys.executable points at the bundled Python interpreter, not
+    the IDA loader, so launching a new instance from it would fail. Use
+    /proc/self/exe to recover the real loader path. On Windows, sys.executable
+    is the IDA loader itself and is correct.
+    """
 
     if sys.platform == "linux":
         return os.readlink("/proc/self/exe")
@@ -429,38 +514,39 @@ def open_file(
     new_database: Annotated[
         bool, "Force creating a new database even if one exists"
     ] = False,
+    wait_until_ready: Annotated[
+        bool, "Wait until the new instance reports auto-analysis and Hex-Rays readiness",
+    ] = True,
     timeout: Annotated[
-        int, "Seconds to wait for the new instance to register (0 = don't wait)"
+        int, "Seconds to wait for the new instance to register and optionally become ready"
     ] = 30,
 ) -> OpenFileResult:
-    """Open a file in a new IDA Pro instance.
-
-    Launches a new IDA process for the given binary. If an existing IDB/i64 database
-    is found, opens that directly (skips the packed/unpacked dialog). Use new_database=True
-    to force a fresh analysis. Use autonomous=True to suppress all IDA dialogs.
-
-    If switch=True (default), automatically routes subsequent tool calls to the new instance.
-    """
+    """Open a file in a new IDA instance and prefer an existing IDB unless told otherwise. By default the tool opens an existing .i64 or .idb for the binary, switches the MCP route to the new instance, and waits until the instance reports that analysis is ready enough for model use. Use new_database=True only when you explicitly want a fresh database instead of the existing one."""
     if not os.path.isfile(file_path):
         return {"success": False, "error": f"File not found: {file_path}"}
 
+    # Get the IDA executable from the currently running instance
     ida_exe = _get_ida_executable()
     if not os.path.isfile(ida_exe):
         return {"success": False, "error": f"Cannot find IDA executable: {ida_exe}"}
 
+    # Determine what to open: existing IDB or raw binary
     target = file_path
+    used_existing = False
     if not new_database:
         existing_idb = _find_existing_idb(file_path)
         if existing_idb:
             target = existing_idb
+            used_existing = True
 
     args = [ida_exe]
     if autonomous:
         args.append("-A")
     if new_database:
-        args.append("-c")
+        args.append("-c")  # Force new database
     args.append(target)
 
+    # Snapshot current instances before launch
     before = {(i["host"], i["port"]) for i in discover_instances()}
 
     try:
@@ -473,8 +559,14 @@ def open_file(
         return {"success": False, "error": f"Failed to launch IDA: {e}"}
 
     if timeout == 0:
-        return {"success": True, "message": "IDA launched, not waiting for registration"}
+        return {
+            "success": True,
+            "message": "IDA launched, not waiting for registration",
+            "used_existing": used_existing,
+            "target_path": target,
+        }
 
+    # Poll for the new instance to register
     deadline = time.monotonic() + timeout
     new_instance = None
     while time.monotonic() < deadline:
@@ -503,11 +595,107 @@ def open_file(
         "port": new_instance["port"],
         "binary": new_instance["binary"],
         "pid": new_instance["pid"],
+        "used_existing": used_existing,
+        "target_path": target,
     }
 
     if switch:
         _set_redirect_target(new_instance["host"], new_instance["port"])
         result["switched"] = True
 
+    if wait_until_ready:
+        ready_state = _wait_until_instance_ready(
+            new_instance["host"], new_instance["port"], timeout
+        )
+        result["ready"] = ready_state.get("ready")
+        if ready_state.get("ready") is True:
+            result["message"] = "IDA instance registered and database is ready"
+        else:
+            result["message"] = (
+                "IDA instance registered but database did not report ready before timeout"
+            )
+    else:
+        result["ready"] = None
+
     return result
 
+
+@tool
+def select_binary(
+    query: Annotated[
+        str,
+        "Binary name, IDB path, or input binary path to select or open",
+    ],
+    switch: Annotated[
+        bool,
+        "Switch MCP routing to the matched or newly opened instance",
+    ] = True,
+    prefer_existing: Annotated[
+        bool,
+        "Prefer an already open instance with a matching binary or IDB before launching a new one",
+    ] = True,
+    new_database: Annotated[
+        bool,
+        "Force creating a new database when launching instead of reusing an existing IDB",
+    ] = False,
+    autonomous: Annotated[
+        bool,
+        "Run a newly launched instance in autonomous mode",
+    ] = False,
+    wait_until_ready: Annotated[
+        bool,
+        "Wait for the selected instance to report that analysis is ready",
+    ] = True,
+    timeout: Annotated[
+        int,
+        "Seconds to wait for readiness or new-instance registration",
+    ] = 60,
+) -> OpenFileResult:
+    """Select a binary by name or path, preferring an existing open IDB and only launching IDA when needed. The tool matches against binary name, input path, and IDB path, so asking for client.so or a full path can reuse the right live instance instead of making you manually switch databases. When it has to launch a new instance, it reuses the existing IDB by default and can wait until the database is ready before handing control back to the model."""
+    query = query.strip()
+    if not query:
+        return {"success": False, "error": "Binary query cannot be empty"}
+
+    instances = list_instances() if prefer_existing else []
+    for inst in instances:
+        if not _matches_binary_query(inst, query):
+            continue
+        result: OpenFileResult = {
+            "success": True,
+            "host": inst["host"],
+            "port": inst["port"],
+            "binary": inst.get("binary", ""),
+            "pid": inst.get("pid", 0),
+            "used_existing": True,
+            "target_path": inst.get("idb_path") or inst.get("input_path"),
+            "ready": inst.get("ready"),
+            "message": "Matched an already open IDA instance",
+        }
+        if switch:
+            _set_redirect_target(inst["host"], inst["port"])
+            result["switched"] = True
+        if wait_until_ready and result.get("ready") is not True:
+            health = _wait_until_instance_ready(inst["host"], inst["port"], timeout)
+            result["ready"] = health.get("ready")
+            if health.get("input_path"):
+                result["target_path"] = health.get("input_path")
+        return result
+
+    normalized_query = _normalize_path(query)
+    if not os.path.isfile(query) and not os.path.isfile(normalized_query):
+        return {
+            "success": False,
+            "error": (
+                "No open IDA instance matched the requested binary and the query is not a valid file path"
+            ),
+        }
+
+    file_path = query if os.path.isfile(query) else normalized_query
+    return open_file(
+        file_path=file_path,
+        switch=switch,
+        autonomous=autonomous,
+        new_database=new_database,
+        wait_until_ready=wait_until_ready,
+        timeout=timeout,
+    )
