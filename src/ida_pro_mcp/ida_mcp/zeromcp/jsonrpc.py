@@ -101,6 +101,177 @@ class RequestCancelledError(Exception):
     """Base class for request cancellation errors (LSP error code -32800)."""
     pass
 
+
+def _type_label(expected_type: Any) -> str:
+    if isinstance(expected_type, type):
+        return expected_type.__name__
+    return str(expected_type)
+
+
+def _parse_json_container(value: str) -> Any:
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def _coerce_list_value(value: Any) -> Any:
+    if isinstance(value, dict) and len(value) == 1:
+        key = next(iter(value))
+        if key in ("item", "items", "value"):
+            return value[key]
+    return value
+
+
+def _coerce_param_value(value: Any, expected_type: Any, param_name: str) -> Any:
+    origin = get_origin(expected_type)
+    args = get_args(expected_type)
+
+    if value is None:
+        if expected_type is type(None):
+            return None
+        if origin in (Union, UnionType) and type(None) in args:
+            return None
+        raise JsonRpcException(-32602, f"Invalid params: {param_name} cannot be null")
+
+    if expected_type is Any:
+        return value
+
+    if origin in (Union, UnionType):
+        errors = []
+        variants = [arg for arg in args if arg is not type(None)]
+        variants.sort(key=lambda arg: arg is str)
+        if isinstance(value, str):
+            parsed = _parse_json_container(value)
+            if parsed is not value:
+                for arg_type in variants:
+                    if arg_type is str:
+                        continue
+                    try:
+                        return _coerce_param_value(parsed, arg_type, param_name)
+                    except JsonRpcException as e:
+                        errors.append(e.message)
+        for arg_type in variants:
+            try:
+                return _coerce_param_value(value, arg_type, param_name)
+            except JsonRpcException as e:
+                errors.append(e.message)
+        raise JsonRpcException(-32602, "Invalid params: expected {} for {}, got {}".format(
+            " | ".join(_type_label(t) for t in args),
+            param_name,
+            type(value).__name__
+        ))
+
+    if origin is list:
+        value = _coerce_list_value(value)
+        if isinstance(value, str):
+            value = _parse_json_container(value)
+        if not isinstance(value, list):
+            raise JsonRpcException(
+                -32602,
+                f"Invalid params: {param_name} expected list, got {type(value).__name__}"
+            )
+        if args:
+            return [
+                _coerce_param_value(item, args[0], param_name)
+                for item in value
+            ]
+        return value
+
+    if origin is dict:
+        if isinstance(value, str):
+            value = _parse_json_container(value)
+        if not isinstance(value, dict):
+            raise JsonRpcException(
+                -32602,
+                f"Invalid params: {param_name} expected dict, got {type(value).__name__}"
+            )
+        return value
+
+    if origin is not None:
+        if not isinstance(value, origin):
+            raise JsonRpcException(
+                -32602,
+                f"Invalid params: {param_name} expected {origin.__name__}, got {type(value).__name__}"
+            )
+        return value
+
+    if is_typeddict(expected_type):
+        if isinstance(value, str):
+            value = _parse_json_container(value)
+        if not isinstance(value, dict):
+            raise JsonRpcException(
+                -32602,
+                f"Invalid params: {param_name} expected dict, got {type(value).__name__}"
+            )
+        return value
+
+    if expected_type is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("1", "true", "yes", "on"):
+                return True
+            if lowered in ("0", "false", "no", "off"):
+                return False
+        raise JsonRpcException(
+            -32602,
+            f"Invalid params: {param_name} expected bool, got {type(value).__name__}"
+        )
+
+    if expected_type is int:
+        if isinstance(value, bool):
+            raise JsonRpcException(
+                -32602,
+                f"Invalid params: {param_name} expected int, got bool"
+            )
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            try:
+                return int(stripped, 0)
+            except ValueError:
+                pass
+        raise JsonRpcException(
+            -32602,
+            f"Invalid params: {param_name} expected int, got {type(value).__name__}"
+        )
+
+    if expected_type is float:
+        if isinstance(value, bool):
+            raise JsonRpcException(
+                -32602,
+                f"Invalid params: {param_name} expected float, got bool"
+            )
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            try:
+                return float(stripped)
+            except ValueError:
+                pass
+        raise JsonRpcException(
+            -32602,
+            f"Invalid params: {param_name} expected float, got {type(value).__name__}"
+        )
+
+    if isinstance(expected_type, type):
+        if not isinstance(value, expected_type):
+            raise JsonRpcException(
+                -32602,
+                f"Invalid params: {param_name} expected {expected_type.__name__}, got {type(value).__name__}"
+            )
+        return value
+
+    return value
+
+
 class JsonRpcRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
@@ -258,112 +429,16 @@ class JsonRpcRegistry:
 
             validated_params = {}
             for param_name, value in params.items():
-                # If no type hint, pass through without validation
                 if param_name not in hints:
                     validated_params[param_name] = value
                     continue
 
-                # Has type hint, validate
                 expected_type = hints[param_name]
-
-                # Inline type validation
-                origin = get_origin(expected_type)
-                args = get_args(expected_type)
-
-                # Handle None/null
-                if value is None:
-                    if expected_type is not type(None):
-                        # Check if None is allowed in a Union
-                        if not (origin in (Union, UnionType) and type(None) in args):
-                            raise JsonRpcException(-32602, f"Invalid params: {param_name} cannot be null")
-                    validated_params[param_name] = None
-                    continue
-
-                # Handle Union types (int | str, Optional[int], etc.)
-                if origin in (Union, UnionType):
-                    type_matched = False
-
-                    # HACK: Try to parse str as JSON for non-str unions
-                    # 
-                    # When JSON schema says one field is "object", Claude Code
-                    # (and maybe other MCP clients) can't (or won't) detect
-                    # that the field is actually a dict/list. Instead, they
-                    # treat the field as a string containing JSON object.
-                    #
-                    # To work around this, if the expected type is a Union
-                    # that does not include str, and the provided value is
-                    # a str, we try to parse it as JSON first.
-                    if type(str) not in args and isinstance(value, str):
-                        try:
-                            value = json.loads(value)
-                        except json.JSONDecodeError:
-                            pass
-
-                    for arg_type in args:
-                        if arg_type is type(None):
-                            continue
-
-                        arg_origin = get_origin(arg_type)
-                        check_type = arg_origin if arg_origin is not None else arg_type
-
-                        # TypedDict cannot be used with isinstance - check for dict instead
-                        if is_typeddict(arg_type):
-                            check_type = dict
-
-                        if isinstance(value, check_type):
-                            type_matched = True
-                            break
-
-                    if not type_matched:
-                        raise JsonRpcException(-32602, "Invalid params: expected {} for {}, got {}".format(
-                            " | ".join(
-                                t.__name__ if isinstance(t, type) else str(t)
-                                for t in args
-                            ),
-                            param_name,
-                            type(value).__name__
-                        ))
-                    validated_params[param_name] = value
-                    continue
-
-                # Handle generic types (list[X], dict[K,V])
-                if origin is not None:
-                    if not isinstance(value, origin):
-                        raise JsonRpcException(
-                            -32602,
-                            f"Invalid params: {param_name} expected {origin.__name__}, got {type(value).__name__}"
-                        )
-                    validated_params[param_name] = value
-                    continue
-
-                # Handle TypedDict (must check before basic types)
-                if is_typeddict(expected_type):
-                    if not isinstance(value, dict):
-                        raise JsonRpcException(
-                            -32602,
-                            f"Invalid params: {param_name} expected dict, got {type(value).__name__}"
-                        )
-                    validated_params[param_name] = value
-                    continue
-
-                # Handle Any
-                if expected_type is Any:
-                    validated_params[param_name] = value
-                    continue
-
-                # Handle basic types
-                if isinstance(expected_type, type):
-                    # Allow int -> float conversion
-                    if expected_type is float and isinstance(value, int):
-                        validated_params[param_name] = float(value)
-                        continue
-                    if not isinstance(value, expected_type):
-                        raise JsonRpcException(
-                            -32602,
-                            f"Invalid params: {param_name} expected {expected_type.__name__}, got {type(value).__name__}"
-                        )
-                    validated_params[param_name] = value
-                    continue
+                validated_params[param_name] = _coerce_param_value(
+                    value,
+                    expected_type,
+                    param_name,
+                )
 
             return func(**validated_params)
 
