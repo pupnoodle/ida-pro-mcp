@@ -122,7 +122,8 @@ def _coerce_list_value(value: Any) -> Any:
     if isinstance(value, dict) and len(value) == 1:
         key = next(iter(value))
         if key in ("item", "items", "value"):
-            return value[key]
+            item = value[key]
+            return item if isinstance(item, list) else [item]
     return value
 
 

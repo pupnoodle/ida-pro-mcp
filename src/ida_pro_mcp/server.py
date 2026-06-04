@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 import sys
+import threading
 import traceback
 from typing import Annotated, Any, TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, urlparse
@@ -76,6 +77,8 @@ class ProxyOpenFileResult(TypedDict, total=False):
 
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
+_target_lock = threading.Lock()
+_session_targets: dict[str, tuple[str, int]] = {}
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
@@ -130,7 +133,47 @@ def _proxy_to_instance(host: str, port: int, payload: bytes | str | dict) -> dic
 
 def _proxy_to_ida(payload: bytes | str | dict) -> dict:
     """Send a JSON-RPC request to the active IDA instance and return the response."""
-    return _proxy_to_instance(IDA_HOST, IDA_PORT, payload)
+    host, port = _get_active_target()
+    return _proxy_to_instance(host, port, payload)
+
+
+def _get_target_session_key() -> str | None:
+    return mcp.get_current_transport_session_id()
+
+
+def _get_active_target() -> tuple[str, int]:
+    session_key = _get_target_session_key()
+    if session_key is not None:
+        with _target_lock:
+            target = _session_targets.get(session_key)
+        if target is not None:
+            return target
+    return IDA_HOST, IDA_PORT
+
+
+def _set_active_target(host: str, port: int) -> None:
+    global IDA_HOST, IDA_PORT
+    session_key = _get_target_session_key()
+    if session_key is not None:
+        with _target_lock:
+            _session_targets[session_key] = (host, port)
+        return
+    IDA_HOST = host
+    IDA_PORT = port
+    set_ida_rpc(IDA_HOST, IDA_PORT)
+
+
+def _clear_active_target() -> tuple[str, int]:
+    global IDA_HOST, IDA_PORT
+    session_key = _get_target_session_key()
+    if session_key is not None:
+        with _target_lock:
+            _session_targets.pop(session_key, None)
+        return IDA_HOST, IDA_PORT
+    IDA_HOST = "127.0.0.1"
+    IDA_PORT = 13337
+    set_ida_rpc(IDA_HOST, IDA_PORT)
+    return IDA_HOST, IDA_PORT
 
 
 def _call_ida_tool(host: str, port: int, name: str, arguments: dict[str, Any]) -> Any:
@@ -246,13 +289,14 @@ mcp.registry.dispatch = dispatch_proxy
 def list_instances() -> list[ProxyInstanceInfo]:
     """List discovered IDA Pro instances and indicate which one is active."""
     result = []
+    active_host, active_port = _get_active_target()
     for inst in discover_instances():
         reachable = probe_instance(inst["host"], inst["port"])
         result.append(
             {
                 **inst,
                 "reachable": reachable,
-                "active": inst["host"] == IDA_HOST and inst["port"] == IDA_PORT,
+                "active": inst["host"] == active_host and inst["port"] == active_port,
             }
         )
     return result
@@ -268,22 +312,17 @@ def select_instance(
     Use list_instances first to see available instances, then select one by port.
     All subsequent tool calls will be routed to the selected instance.
     """
-    global IDA_HOST, IDA_PORT
     if port == 0:
-        IDA_HOST = "127.0.0.1"
-        IDA_PORT = 13337
-        set_ida_rpc(IDA_HOST, IDA_PORT)
+        host, port = _clear_active_target()
         return {
             "success": True,
-            "host": IDA_HOST,
-            "port": IDA_PORT,
+            "host": host,
+            "port": port,
             "message": "Reset to default IDA target",
         }
     if not probe_instance(host, port):
         return {"success": False, "error": f"Instance at {host}:{port} is not reachable"}
-    IDA_HOST = host
-    IDA_PORT = port
-    set_ida_rpc(IDA_HOST, IDA_PORT)
+    _set_active_target(host, port)
     return {"success": True, "host": host, "port": port}
 
 
@@ -311,8 +350,7 @@ def open_file(
     implementation so discovery/launch remains available even when the currently
     selected instance is down.
     """
-    target_host = IDA_HOST
-    target_port = IDA_PORT
+    target_host, target_port = _get_active_target()
     if not probe_instance(target_host, target_port):
         target_host = ""
         target_port = 0

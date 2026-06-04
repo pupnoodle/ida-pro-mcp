@@ -63,6 +63,7 @@ def _saved_target():
     """Preserve the currently selected IDA target across assertions."""
     old_host = server.IDA_HOST
     old_port = server.IDA_PORT
+    old_targets = server._session_targets.copy()
     old_session = getattr(server.mcp._transport_session_id, "data", None)
     old_exts = getattr(server.mcp._enabled_extensions, "data", set())
     try:
@@ -70,6 +71,8 @@ def _saved_target():
     finally:
         server.IDA_HOST = old_host
         server.IDA_PORT = old_port
+        server._session_targets.clear()
+        server._session_targets.update(old_targets)
         server.mcp._transport_session_id.data = old_session
         server.mcp._enabled_extensions.data = old_exts
 
@@ -118,6 +121,37 @@ def test_resolve_ida_rpc_preserves_ext_query_param():
         assert server.IDA_PORT == 9999
         exts = getattr(server.mcp._enabled_extensions, "data", set())
         assert "dbg" in exts, f"Expected 'dbg' in enabled extensions, got: {exts}"
+
+
+@test()
+def test_select_instance_is_scoped_to_transport_session():
+    with _saved_target():
+        original_probe = server.probe_instance
+        server.probe_instance = lambda host, port: True
+        try:
+            server.mcp._transport_session_id.data = "http:agent-a"
+            result_a = server.select_instance(port=13343)
+            assert result_a["success"] is True
+
+            server.mcp._transport_session_id.data = "http:agent-b"
+            result_b = server.select_instance(port=13344)
+            assert result_b["success"] is True
+
+            server.mcp._transport_session_id.data = "http:agent-a"
+            assert server._get_active_target() == ("127.0.0.1", 13343)
+
+            server.mcp._transport_session_id.data = "http:agent-b"
+            assert server._get_active_target() == ("127.0.0.1", 13344)
+
+            server.mcp._transport_session_id.data = "http:agent-a"
+            reset = server.select_instance(port=0)
+            assert reset["success"] is True
+            assert server._get_active_target() == (server.IDA_HOST, server.IDA_PORT)
+
+            server.mcp._transport_session_id.data = "http:agent-b"
+            assert server._get_active_target() == ("127.0.0.1", 13344)
+        finally:
+            server.probe_instance = original_probe
 
 
 @test()
